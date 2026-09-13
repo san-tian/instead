@@ -358,3 +358,15 @@ test('/cancel：没有正在进行的任务 → 说明没什么可取消', async
   await waitFor(() => channel.sent.length > 0);
   assert.match(channel.textsFor(keyFor('oc_a')).join('\n'), /没什么可取消/);
 });
+
+test('turn timeout：群里收到恢复指引而不是干巴巴的「处理失败」', async () => {
+  const { db, channel, dispatcher } = setup({ fail: true, failError: 'turn timeout' });
+  bind(db, 'oc_a');
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '帮我跑个大任务' }));
+  await waitFor(() => channel.sent.length > 0);
+  const text = channel.textsFor(keyFor('oc_a')).join('\n');
+  assert.match(text, /处理超时/);
+  assert.match(text, /上下文没有丢/);
+  assert.match(text, /后台/);
+  assert.doesNotMatch(text, /^处理失败：turn timeout$/, '不再只回干巴巴的原始错误');
+});
