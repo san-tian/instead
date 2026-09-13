@@ -32,6 +32,8 @@ import { getBootstrapRecord, saveBootstrapRecord } from './state/bootstrap.ts';
 import { getBool, getInt, SETTINGS } from './state/settings.ts';
 import { listBindings, updateBindingSession } from './state/bindings.ts';
 import type {
+  AgentAdapter,
+  AgentSessionHandle,
   Attachment,
   ConversationKey,
   ContextBlock,
@@ -39,6 +41,7 @@ import type {
   OutboundMessage,
   SessionRef,
   TurnEvent,
+  TurnHandle,
 } from './types.ts';
 
 export interface DispatcherOptions {
@@ -71,6 +74,11 @@ export class Dispatcher {
   private readonly chunkLimit: number;
   private readonly maxSendAttempts: number;
   private readonly bootstrap: { enabled: boolean; maxMessages: number; maxAgeDays: number };
+  /** 每个 session 正在跑的那条 turn（/cancel 用，决策 28）。queue 保证每 session 最多一条。 */
+  private readonly activeTurns = new Map<
+    string,
+    { adapter: AgentAdapter; handle: AgentSessionHandle; turn: TurnHandle; chatId: string }
+  >();
   private readonly onTurnEvent?: (event: TurnEvent) => void;
   /** 串行化 flush：deliver 与 daemon 定时器可能同时触发，不排队就会同一条发两遍 */
   private flushChain: Promise<void> = Promise.resolve();
@@ -122,28 +130,49 @@ export class Dispatcher {
     if (!ref) return;
 
     // /new（决策 25）：控制命令，旁路队列直接执行 —— 排队等一个 agent turn 才轮到换会话没有意义
-    if (isNewCommand(msg.text)) {
-      await this.runNew(msg, ref, log);
+    const newPayload = parseNewCommand(msg.text);
+    if (newPayload !== null) {
+      await this.runNew(msg, ref, log, newPayload);
       markInbound(this.db, msg.id, 'done');
       return;
     }
 
+    // /cancel（决策 28）：同理由旁路 —— 等排队排到自己再取消没有意义
+    if (isCancelCommand(msg.text)) {
+      await this.runCancel(msg, ref, log);
+      markInbound(this.db, msg.id, 'done');
+      return;
+    }
+
+    await this.enqueueTurn(msg, ref, log);
+  }
+
+  /** 正常入队：组 pending 窗口、进队列、回执。runNew 的带参形式也走这里。 */
+  private async enqueueTurn(
+    msg: InboundMessage,
+    ref: NonNullable<ReturnType<typeof sessionRefFor>>,
+    log: Logger,
+  ): Promise<void> {
     const window = pendingWindowFor(
       this.db,
       chatIdOf(msg),
       getInt(this.db, SETTINGS.pendingWindowMax, this.pendingWindowLimit),
     );
     const context = formatPendingWindow(msg, window);
+    const traceId = newTraceId();
 
     const { ahead, dropped } = this.queue.enqueue(ref.sessionId, {
       chatId: chatIdOf(msg),
       enqueuedAt: Date.now(),
       run: () => this.runTurn(msg, ref, context, traceId),
       onDrop: (reason) => {
-        void this.reply(
-          msg.conversationKey,
-          reason === 'overflow' ? '消息队列已满，本条已丢弃。' : '消息排队超时，本条已丢弃。',
-        );
+        // cancelled（/cancel 撤掉的）不回消息：runCancel 的统一确认文案已覆盖
+        if (reason !== 'cancelled') {
+          void this.reply(
+            msg.conversationKey,
+            reason === 'overflow' ? '消息队列已满，本条已丢弃。' : '消息排队超时，本条已丢弃。',
+          );
+        }
         markInbound(this.db, msg.id, 'dropped');
       },
     });
@@ -198,12 +227,15 @@ export class Dispatcher {
         ...(media.images.length ? { images: media.images } : {}),
       });
       turnId = turn.turnId;
+      const activeKey = ref.sessionId;
+      this.activeTurns.set(activeKey, { adapter, handle, turn, chatId: chatIdOf(msg) });
       const off = turn.onEvent((event) => {
         this.onTurnEvent?.({ ...event, conversationKey: msg.conversationKey });
         log.debug('turn event', { turnId: event.turnId, kind: event.type });
       });
       const result = await turn.settled;
       off();
+      if (this.activeTurns.get(activeKey)?.turn === turn) this.activeTurns.delete(activeKey);
       this.driver.touch(ref);
 
       if (result.error) {
@@ -353,9 +385,18 @@ export class Dispatcher {
    * 不是 transcript：本机那条会话连备份都不用做。
    *
    * 旧会话若没有别的群还在用，顺手放掉进程（idle 回收本来也会做）。
+   *
+   * `payload` 非空 = `/new <文字>`：换完会话后把文字当新会话的第一条消息立即跑。
+   * bootstrap（§6.2）按 (session_id, chat_id) 幂等，新 id 必不命中 →
+   * 最近 50 条群历史照常注入，和刚绑定时一样（所以裸 /new 的 ack 不再说「空白上下文」）。
    */
-  private async runNew(msg: InboundMessage, ref: SessionRef, log: Logger): Promise<void> {
-    log.info('new-session command received');
+  private async runNew(
+    msg: InboundMessage,
+    ref: SessionRef,
+    log: Logger,
+    payload: string,
+  ): Promise<void> {
+    log.info('new-session command received', { hasPayload: Boolean(payload) });
     await this.channel
       .receipt(msg.conversationKey, 'seen', msg.replyTo ? { replyTo: msg.replyTo } : {})
       .catch(() => undefined);
@@ -372,11 +413,59 @@ export class Dispatcher {
       await this.queue.bypass(() => this.driver.release(ref.sessionId));
     }
 
+    if (payload) {
+      await this.reply(
+        msg.conversationKey,
+        `已开新会话 ✅ 正在新会话 ${newId} 里处理你的消息。` +
+          `旧会话 ${ref.sessionId} 原样保留在本机，随时可以继续用。`,
+      );
+      // 绑定已经指向新会话，重走正常入队即可。msg.id 已在本轮标 done，
+      // 这里只借它的形状换文字，不重复走 decide/record。
+      const stripped: InboundMessage = { ...msg, text: payload };
+      await this.enqueueTurn(stripped, sessionRefFor(this.db, chatId)!, log);
+      return;
+    }
     await this.reply(
       msg.conversationKey,
-      `已开新会话 ✅ 本群已切到新会话 ${newId}（空白上下文）。` +
-        `旧会话 ${ref.sessionId} 原样保留在本机，随时可以继续用。`,
+      `已开新会话 ✅ 本群已切到新会话 ${newId}。` +
+        `旧会话 ${ref.sessionId} 原样保留在本机，随时可以继续用。` +
+        `新会话的第一条消息会自动带上本群最近 50 条（7 天内）只读上下文，和刚绑定时一样。`,
     );
+  }
+
+  /**
+   * /cancel（决策 28）：终止本群发起的 turn。
+   * - 正在跑的那条如果就是本群发起的 → adapter.abort（pi 走 RPC abort，claude/codex 杀子进程）
+   * - 本群还排在队列里的 → 全部撤掉（1:N 下别的群的排队和运行中的 turn 不动）
+   * - 会话上下文一律保留：取消不丢记忆，下一条消息接着聊
+   */
+  private async runCancel(msg: InboundMessage, ref: SessionRef, log: Logger): Promise<void> {
+    log.info('cancel command received');
+    await this.channel
+      .receipt(msg.conversationKey, 'seen', msg.replyTo ? { replyTo: msg.replyTo } : {})
+      .catch(() => undefined);
+
+    const chatId = chatIdOf(msg);
+    const queued = this.queue.cancelChat(ref.sessionId, chatId);
+    const active = this.activeTurns.get(ref.sessionId);
+    const mine = active !== undefined && active.chatId === chatId;
+    if (mine) {
+      await active.adapter.abort(active.handle, active.turn.turnId).catch((err: unknown) => {
+        log.warn('abort failed', { error: String(err) });
+      });
+    }
+
+    let text: string;
+    if (mine && queued > 0) {
+      text = `已取消 ✅ 正在进行的任务已中止，排队中的 ${queued} 条消息也撤了。会话上下文保留，随时可以继续。`;
+    } else if (mine) {
+      text = '已取消 ✅ 正在进行的任务已中止。会话上下文保留，随时可以继续。';
+    } else if (queued > 0) {
+      text = `已取消 ✅ 本群排队中的 ${queued} 条消息已撤。（正在跑的那条是另一个群发起的，本群不能替它停。）`;
+    } else {
+      text = '当前没有正在进行的任务，没什么可取消的。';
+    }
+    await this.reply(msg.conversationKey, text);
   }
 
   /**
@@ -501,8 +590,20 @@ export class Dispatcher {
 
 const formatTime = (ts: number): string => new Date(ts).toISOString().slice(11, 16); // HH:MM
 
-/** 控制命令：独占一行的 /new（决策 25）。带额外文字就按普通消息处理，别误吞。 */
-export const isNewCommand = (text: string): boolean => /^\s*\/new\s*$/i.test(text.trim());
+/** 控制命令：/cancel（决策 28）。只认单行（多行消息里夹一行不触发）。 */
+export const isCancelCommand = (text: string): boolean => /^\s*\/cancel\s*$/i.test(text.trim());
+
+/**
+ * 控制命令：/new（决策 25）。只认**单行**（多行消息里夹一行 /new 不触发）。
+ * - null = 不是命令
+ * - '' = 裸 /new（只换会话）
+ * - 其他 = 新会话的第一条消息（`/new 看看目前有哪些机器` → 「看看目前有哪些机器」）
+ */
+export const parseNewCommand = (text: string): string | null => {
+  const m = text.trim().match(/^\/new(?:\s+(.*))?$/i);
+  if (!m) return null;
+  return (m[1] ?? '').trim();
+}
 
 /** 4000 字分片，优先在换行处切，保护代码块（§10.1） */
 export function splitText(text: string, limit: number): string[] {

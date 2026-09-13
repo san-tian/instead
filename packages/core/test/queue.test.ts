@@ -69,3 +69,39 @@ test('控制类消息旁路：不排队，立刻执行（缺口 A）', async () 
   assert.deepEqual(order, ['start:long', 'control']);
   await q.idle('s1');
 });
+
+test('cancelChat：只撤这个 chat 的排队任务，别的 chat 不动（决策 28）', async () => {
+  const queue = new SessionQueue();
+  const droppedA: string[] = [];
+  const droppedB: string[] = [];
+  let bRan = false;
+  queue.enqueue('sess', {
+    chatId: 'oc_a',
+    enqueuedAt: Date.now(),
+    run: async () => {},
+    onDrop: (r) => droppedA.push(r),
+  });
+  queue.enqueue('sess', {
+    chatId: 'oc_b',
+    enqueuedAt: Date.now(),
+    run: async () => {
+      bRan = true;
+    },
+    onDrop: (r) => droppedB.push(r),
+  });
+  // 让第一批先跑完（oc_b 第一批跑过，重置标记）
+  await queue.idle('sess');
+  bRan = false;
+  // 重新排队：oc_a 占住运行位，oc_b 排队
+  const gate = new Promise<void>((res) => setTimeout(res, 30));
+  queue.enqueue('sess', { chatId: 'oc_a', enqueuedAt: Date.now(), run: () => gate, onDrop: (r) => droppedA.push(r) });
+  queue.enqueue('sess', { chatId: 'oc_b', enqueuedAt: Date.now(), run: async () => { bRan = true; }, onDrop: (r) => droppedB.push(r) });
+
+  const removed = queue.cancelChat('sess', 'oc_b');
+  assert.equal(removed, 1, '撤掉 oc_b 排的那条');
+  assert.deepEqual(droppedB, ['cancelled'], 'onDrop 收到 cancelled');
+  assert.equal(queue.pendingForChat('sess', 'oc_b'), 0, 'oc_b 计数归零');
+  assert.equal(queue.pendingForChat('sess', 'oc_a'), 1, 'oc_a 不动');
+  await queue.idle('sess');
+  assert.equal(bRan, false, 'oc_b 那条没有再跑');
+});
