@@ -19,7 +19,7 @@ interface Pending {
   chatId: string;
   enqueuedAt: number;
   run: () => Promise<void>;
-  onDrop?: (reason: 'overflow' | 'expired') => void;
+  onDrop?: (reason: 'overflow' | 'expired' | 'cancelled') => void;
 }
 
 const chatKey = (sessionId: string, chatId: string): string => `${sessionId}\u0000${chatId}`;
@@ -69,6 +69,32 @@ export class SessionQueue {
   /** 控制类消息（/stop 等）旁路，不排队（缺口 A） */
   async bypass<T>(fn: () => Promise<T>): Promise<T> {
     return fn();
+  }
+
+  /**
+   * /cancel（决策 28）：撤掉某 chat 还没开跑的排队任务（正在跑的那条由 dispatcher
+   * 直接 abort，不在这里）。只撤这个 chat 的 —— 1:N 下别的群排的队不能动。
+   * 返回撤掉了几条。
+   */
+  cancelChat(sessionId: string, chatId: string): number {
+    const list = this.pending.get(sessionId);
+    if (!list?.length) return 0;
+    let removed = 0;
+    const keep: Pending[] = [];
+    for (const p of list) {
+      if (p.chatId === chatId) {
+        this.decPerChat(sessionId, chatId);
+        p.onDrop?.('cancelled');
+        removed++;
+      } else {
+        keep.push(p);
+      }
+    }
+    this.pending.set(sessionId, keep);
+    if (removed > 0) {
+      this.opts.logger.info('cancel command dropped queued tasks', { sessionId, chatId, removed });
+    }
+    return removed;
   }
 
   pendingCount(sessionId: string): number {

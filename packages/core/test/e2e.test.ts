@@ -321,3 +321,40 @@ test('/new 在多行消息里不触发（独占一行才认）', async () => {
   assert.equal(adapter.received.length, 1, '按普通消息处理');
   assert.equal(getBinding(db, 'oc_a')!.sessionId, 'sess-1', '绑定不动');
 });
+
+test('/cancel：正在跑的是本群发起的 → abort + 确认文案', async () => {
+  const { db, channel, adapter, dispatcher } = setup({ reply: 'ok', delayMs: 400 });
+  bind(db, 'oc_a');
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '跑个大任务' }));
+  await waitFor(() => adapter.received.length === 1);
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '/cancel' }));
+  await waitFor(() => channel.textsFor(keyFor('oc_a')).join('\n').includes('已取消'));
+  assert.equal(adapter.aborted.length, 1, '本群的 turn 被 abort');
+  const text = channel.textsFor(keyFor('oc_a')).join('\n');
+  assert.match(text, /正在进行的任务已中止/);
+});
+
+test('/cancel：本群的排队消息被撤，另一个群正在跑的不动（1:N）', async () => {
+  const { db, channel, adapter, dispatcher } = setup({ reply: 'ok', delayMs: 300 });
+  bind(db, 'oc_a');
+  bind(db, 'oc_b', 'sess-1'); // 1:N：两个群共享同一条会话
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_b', text: '长任务' }));
+  await waitFor(() => adapter.received.length === 1);
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '排队的那条' }));
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '/cancel' }));
+  await waitFor(() => channel.textsFor(keyFor('oc_a')).join('\n').includes('已取消'));
+  assert.equal(adapter.aborted.length, 0, '别的群在跑，本群不能替它停');
+  const text = channel.textsFor(keyFor('oc_a')).join('\n');
+  assert.match(text, /排队中的 1 条消息已撤/);
+  assert.match(text, /另一个群/);
+  await waitFor(() => adapter.received.length >= 1);
+  assert.equal(adapter.received.length, 1, '被撤的那条没有再跑');
+});
+
+test('/cancel：没有正在进行的任务 → 说明没什么可取消', async () => {
+  const { db, channel, dispatcher } = setup();
+  bind(db, 'oc_a');
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '/cancel' }));
+  await waitFor(() => channel.sent.length > 0);
+  assert.match(channel.textsFor(keyFor('oc_a')).join('\n'), /没什么可取消/);
+});

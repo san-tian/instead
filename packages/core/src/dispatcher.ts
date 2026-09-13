@@ -32,6 +32,8 @@ import { getBootstrapRecord, saveBootstrapRecord } from './state/bootstrap.ts';
 import { getBool, getInt, SETTINGS } from './state/settings.ts';
 import { listBindings, updateBindingSession } from './state/bindings.ts';
 import type {
+  AgentAdapter,
+  AgentSessionHandle,
   Attachment,
   ConversationKey,
   ContextBlock,
@@ -39,6 +41,7 @@ import type {
   OutboundMessage,
   SessionRef,
   TurnEvent,
+  TurnHandle,
 } from './types.ts';
 
 export interface DispatcherOptions {
@@ -71,6 +74,11 @@ export class Dispatcher {
   private readonly chunkLimit: number;
   private readonly maxSendAttempts: number;
   private readonly bootstrap: { enabled: boolean; maxMessages: number; maxAgeDays: number };
+  /** 每个 session 正在跑的那条 turn（/cancel 用，决策 28）。queue 保证每 session 最多一条。 */
+  private readonly activeTurns = new Map<
+    string,
+    { adapter: AgentAdapter; handle: AgentSessionHandle; turn: TurnHandle; chatId: string }
+  >();
   private readonly onTurnEvent?: (event: TurnEvent) => void;
   /** 串行化 flush：deliver 与 daemon 定时器可能同时触发，不排队就会同一条发两遍 */
   private flushChain: Promise<void> = Promise.resolve();
@@ -129,6 +137,13 @@ export class Dispatcher {
       return;
     }
 
+    // /cancel（决策 28）：同理由旁路 —— 等排队排到自己再取消没有意义
+    if (isCancelCommand(msg.text)) {
+      await this.runCancel(msg, ref, log);
+      markInbound(this.db, msg.id, 'done');
+      return;
+    }
+
     await this.enqueueTurn(msg, ref, log);
   }
 
@@ -151,10 +166,13 @@ export class Dispatcher {
       enqueuedAt: Date.now(),
       run: () => this.runTurn(msg, ref, context, traceId),
       onDrop: (reason) => {
-        void this.reply(
-          msg.conversationKey,
-          reason === 'overflow' ? '消息队列已满，本条已丢弃。' : '消息排队超时，本条已丢弃。',
-        );
+        // cancelled（/cancel 撤掉的）不回消息：runCancel 的统一确认文案已覆盖
+        if (reason !== 'cancelled') {
+          void this.reply(
+            msg.conversationKey,
+            reason === 'overflow' ? '消息队列已满，本条已丢弃。' : '消息排队超时，本条已丢弃。',
+          );
+        }
         markInbound(this.db, msg.id, 'dropped');
       },
     });
@@ -209,12 +227,15 @@ export class Dispatcher {
         ...(media.images.length ? { images: media.images } : {}),
       });
       turnId = turn.turnId;
+      const activeKey = ref.sessionId;
+      this.activeTurns.set(activeKey, { adapter, handle, turn, chatId: chatIdOf(msg) });
       const off = turn.onEvent((event) => {
         this.onTurnEvent?.({ ...event, conversationKey: msg.conversationKey });
         log.debug('turn event', { turnId: event.turnId, kind: event.type });
       });
       const result = await turn.settled;
       off();
+      if (this.activeTurns.get(activeKey)?.turn === turn) this.activeTurns.delete(activeKey);
       this.driver.touch(ref);
 
       if (result.error) {
@@ -412,6 +433,41 @@ export class Dispatcher {
   }
 
   /**
+   * /cancel（决策 28）：终止本群发起的 turn。
+   * - 正在跑的那条如果就是本群发起的 → adapter.abort（pi 走 RPC abort，claude/codex 杀子进程）
+   * - 本群还排在队列里的 → 全部撤掉（1:N 下别的群的排队和运行中的 turn 不动）
+   * - 会话上下文一律保留：取消不丢记忆，下一条消息接着聊
+   */
+  private async runCancel(msg: InboundMessage, ref: SessionRef, log: Logger): Promise<void> {
+    log.info('cancel command received');
+    await this.channel
+      .receipt(msg.conversationKey, 'seen', msg.replyTo ? { replyTo: msg.replyTo } : {})
+      .catch(() => undefined);
+
+    const chatId = chatIdOf(msg);
+    const queued = this.queue.cancelChat(ref.sessionId, chatId);
+    const active = this.activeTurns.get(ref.sessionId);
+    const mine = active !== undefined && active.chatId === chatId;
+    if (mine) {
+      await active.adapter.abort(active.handle, active.turn.turnId).catch((err: unknown) => {
+        log.warn('abort failed', { error: String(err) });
+      });
+    }
+
+    let text: string;
+    if (mine && queued > 0) {
+      text = `已取消 ✅ 正在进行的任务已中止，排队中的 ${queued} 条消息也撤了。会话上下文保留，随时可以继续。`;
+    } else if (mine) {
+      text = '已取消 ✅ 正在进行的任务已中止。会话上下文保留，随时可以继续。';
+    } else if (queued > 0) {
+      text = `已取消 ✅ 本群排队中的 ${queued} 条消息已撤。（正在跑的那条是另一个群发起的，本群不能替它停。）`;
+    } else {
+      text = '当前没有正在进行的任务，没什么可取消的。';
+    }
+    await this.reply(msg.conversationKey, text);
+  }
+
+  /**
    * bootstrapHistory（§6.2）：该群第一次触发时，把最近 N 条历史作为只读上下文注入一次。
    * 幂等：以 (session_id, chat_id) 记入 bootstrap_records，重启/重绑不重复。
    */
@@ -532,6 +588,9 @@ export class Dispatcher {
 }
 
 const formatTime = (ts: number): string => new Date(ts).toISOString().slice(11, 16); // HH:MM
+
+/** 控制命令：/cancel（决策 28）。只认单行（多行消息里夹一行不触发）。 */
+export const isCancelCommand = (text: string): boolean => /^\s*\/cancel\s*$/i.test(text.trim());
 
 /**
  * 控制命令：/new（决策 25）。只认**单行**（多行消息里夹一行 /new 不触发）。
