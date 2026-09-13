@@ -99,6 +99,8 @@ export interface FakeAdapterOptions {
   /** 每个 turn 的耗时，用来制造排队场景 */
   delayMs?: number;
   fail?: boolean;
+  /** 失败时结算的错误文本（默认 'fake failure'）—— 超时路径测试用 */
+  failError?: string;
   sessionId?: string;
   /** 图片输入能力（决策 26），默认 true（像 pi/codex） */
   images?: boolean;
@@ -129,6 +131,7 @@ export class FakeAdapter implements AgentAdapter {
   private readonly reply: string | ((msg: UserMessage) => string);
   private readonly delayMs: number;
   private readonly fail: boolean;
+  private readonly failError?: string;
   private readonly sessionId: string;
   private started = 0;
   /** 每次 start 的入参，便于断言池子往里传了什么 */
@@ -138,6 +141,7 @@ export class FakeAdapter implements AgentAdapter {
     this.reply = opts.reply ?? 'fake reply';
     this.delayMs = opts.delayMs ?? 0;
     this.fail = opts.fail ?? false;
+    this.failError = opts.failError;
     this.sessionId = opts.sessionId ?? 'fake-session';
     this.capabilities = { ...this.capabilities, images: opts.images ?? true };
   }
@@ -182,8 +186,9 @@ export class FakeAdapter implements AgentAdapter {
       const key = msg.conversationKey ?? ('feishu:chat:unknown' as ConversationKey);
       emit({ turnId, conversationKey: key, type: 'started' });
       if (this.fail) {
-        emit({ turnId, conversationKey: key, type: 'error', text: 'fake failure' });
-        finish({ text: '', aborted: false, error: 'fake failure' });
+        const err = this.failError ?? 'fake failure';
+        emit({ turnId, conversationKey: key, type: 'error', text: err });
+        finish({ text: '', aborted: false, error: err });
         return;
       }
       const text = typeof this.reply === 'function' ? this.reply(msg) : this.reply;

@@ -16,6 +16,7 @@ import { ClaudeAdapter } from '@instead/adapter-claude';
 import { CodexAdapter, type SandboxMode } from '@instead/adapter-codex';
 import { FeishuChannel } from '@instead/channel-feishu';
 import { Daemon } from './server.ts';
+import { DEFAULT_TURN_GUIDANCE } from './guidance.ts';
 
 /**
  * daemon 入口：`instead daemon run`（前台）或 `daemon start`（后台，输出重定向到日志）。
@@ -58,14 +59,17 @@ export async function runDaemon(): Promise<void> {
     appSecret: cred.appSecret,
     logger,
   });
+  // 决策 27：长任务异步化引导（默认文案可用 INSTEAD_AGENT_GUIDANCE 整体替换）
+  const turnGuidance = process.env.INSTEAD_AGENT_GUIDANCE ?? DEFAULT_TURN_GUIDANCE;
   const daemon = new Daemon({
     db,
     channel,
     adapters: {
-      pi: new PiAdapter({ logger }),
-      claude: new ClaudeAdapter({ logger }),
+      pi: new PiAdapter({ logger, appendSystemPrompt: turnGuidance }),
+      claude: new ClaudeAdapter({ logger, appendSystemPrompt: turnGuidance }),
       codex: new CodexAdapter({
         logger,
+        appendSystemPrompt: turnGuidance,
         getSandboxMode: () => getSetting(db, 'codex.sandbox_mode') as SandboxMode | undefined,
       }),
     },

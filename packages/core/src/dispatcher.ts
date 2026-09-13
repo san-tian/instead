@@ -240,9 +240,12 @@ export class Dispatcher {
 
       if (result.error) {
         log.error('turn failed', { turnId, error: result.error });
-        await this.reply(msg.conversationKey, `处理失败：${result.error.slice(0, 300)}`).catch(
-          () => undefined,
-        );
+        // 超时不是死胡同：上下文没丢、下一条消息就能继续 —— 把话说清楚，别让群里干瞪眼
+        const replyText = /timeout/i.test(result.error)
+          ? '处理超时：这轮超过了时限被中断（会话上下文没有丢，直接发条消息就能继续）。' +
+            '建议让耗时任务在后台异步跑、进度写文件，这一轮先短汇报。'
+          : `处理失败：${result.error.slice(0, 300)}`;
+        await this.reply(msg.conversationKey, replyText).catch(() => undefined);
       }
       if (result.aborted) log.info('turn aborted', { turnId });
 
