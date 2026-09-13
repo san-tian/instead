@@ -122,18 +122,29 @@ export class Dispatcher {
     if (!ref) return;
 
     // /new（决策 25）：控制命令，旁路队列直接执行 —— 排队等一个 agent turn 才轮到换会话没有意义
-    if (isNewCommand(msg.text)) {
-      await this.runNew(msg, ref, log);
+    const newPayload = parseNewCommand(msg.text);
+    if (newPayload !== null) {
+      await this.runNew(msg, ref, log, newPayload);
       markInbound(this.db, msg.id, 'done');
       return;
     }
 
+    await this.enqueueTurn(msg, ref, log);
+  }
+
+  /** 正常入队：组 pending 窗口、进队列、回执。runNew 的带参形式也走这里。 */
+  private async enqueueTurn(
+    msg: InboundMessage,
+    ref: NonNullable<ReturnType<typeof sessionRefFor>>,
+    log: Logger,
+  ): Promise<void> {
     const window = pendingWindowFor(
       this.db,
       chatIdOf(msg),
       getInt(this.db, SETTINGS.pendingWindowMax, this.pendingWindowLimit),
     );
     const context = formatPendingWindow(msg, window);
+    const traceId = newTraceId();
 
     const { ahead, dropped } = this.queue.enqueue(ref.sessionId, {
       chatId: chatIdOf(msg),
@@ -352,9 +363,18 @@ export class Dispatcher {
    * 不是 transcript：本机那条会话连备份都不用做。
    *
    * 旧会话若没有别的群还在用，顺手放掉进程（idle 回收本来也会做）。
+   *
+   * `payload` 非空 = `/new <文字>`：换完会话后把文字当新会话的第一条消息立即跑。
+   * bootstrap（§6.2）按 (session_id, chat_id) 幂等，新 id 必不命中 →
+   * 最近 50 条群历史照常注入，和刚绑定时一样（所以裸 /new 的 ack 不再说「空白上下文」）。
    */
-  private async runNew(msg: InboundMessage, ref: SessionRef, log: Logger): Promise<void> {
-    log.info('new-session command received');
+  private async runNew(
+    msg: InboundMessage,
+    ref: SessionRef,
+    log: Logger,
+    payload: string,
+  ): Promise<void> {
+    log.info('new-session command received', { hasPayload: Boolean(payload) });
     await this.channel
       .receipt(msg.conversationKey, 'seen', msg.replyTo ? { replyTo: msg.replyTo } : {})
       .catch(() => undefined);
@@ -371,10 +391,23 @@ export class Dispatcher {
       await this.queue.bypass(() => this.driver.release(ref.sessionId));
     }
 
+    if (payload) {
+      await this.reply(
+        msg.conversationKey,
+        `已开新会话 ✅ 正在新会话 ${newId} 里处理你的消息。` +
+          `旧会话 ${ref.sessionId} 原样保留在本机，随时可以继续用。`,
+      );
+      // 绑定已经指向新会话，重走正常入队即可。msg.id 已在本轮标 done，
+      // 这里只借它的形状换文字，不重复走 decide/record。
+      const stripped: InboundMessage = { ...msg, text: payload };
+      await this.enqueueTurn(stripped, sessionRefFor(this.db, chatId)!, log);
+      return;
+    }
     await this.reply(
       msg.conversationKey,
-      `已开新会话 ✅ 本群已切到新会话 ${newId}（空白上下文）。` +
-        `旧会话 ${ref.sessionId} 原样保留在本机，随时可以继续用。`,
+      `已开新会话 ✅ 本群已切到新会话 ${newId}。` +
+        `旧会话 ${ref.sessionId} 原样保留在本机，随时可以继续用。` +
+        `新会话的第一条消息会自动带上本群最近 50 条（7 天内）只读上下文，和刚绑定时一样。`,
     );
   }
 
@@ -500,8 +533,17 @@ export class Dispatcher {
 
 const formatTime = (ts: number): string => new Date(ts).toISOString().slice(11, 16); // HH:MM
 
-/** 控制命令：独占一行的 /new（决策 25）。带额外文字就按普通消息处理，别误吞。 */
-export const isNewCommand = (text: string): boolean => /^\s*\/new\s*$/i.test(text.trim());
+/**
+ * 控制命令：/new（决策 25）。只认**单行**（多行消息里夹一行 /new 不触发）。
+ * - null = 不是命令
+ * - '' = 裸 /new（只换会话）
+ * - 其他 = 新会话的第一条消息（`/new 看看目前有哪些机器` → 「看看目前有哪些机器」）
+ */
+export const parseNewCommand = (text: string): string | null => {
+  const m = text.trim().match(/^\/new(?:\s+(.*))?$/i);
+  if (!m) return null;
+  return (m[1] ?? '').trim();
+}
 
 /** 4000 字分片，优先在换行处切，保护代码块（§10.1） */
 export function splitText(text: string, limit: number): string[] {
