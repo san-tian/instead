@@ -34,6 +34,8 @@ import { UiData } from './ui-data.ts';
 import { UiServer } from './http.ts';
 
 export interface DaemonOptions {
+  /** 决策 29：流式进度卡（默认开，渠道要声明 patches 能力） */
+  streamProgress?: boolean;
   db: Db;
   channel: Channel;
   adapters: Partial<Record<AgentId, AgentAdapter>>;
@@ -102,6 +104,7 @@ export class Daemon {
       driver: this.pool,
       queue: this.queue,
       logger: this.logger,
+      ...(opts.streamProgress !== undefined ? { streamProgress: opts.streamProgress } : {}),
     });
     this.uiData = new UiData({
       db: opts.db,

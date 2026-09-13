@@ -30,6 +30,7 @@ test('daemon：通过 IPC 完成绑定 → 注入入站 → 出站回复 全链�
     adapters: { pi: adapter },
     socketPath,
     allowInjection: true,
+    streamProgress: false,
     flushIntervalMs: 60_000,
     sweepIntervalMs: 60_000,
   });

@@ -10,13 +10,17 @@ import { enqueueOutbound } from '../src/state/outbound.ts';
 import { FakeAdapter, FakeChannel, FakeDriver } from '../src/testing/index.ts';
 import type { Db } from '../src/state/db.ts';
 
-function setup(adapterOpts: ConstructorParameters<typeof FakeAdapter>[0] = {}) {
+function setup(
+  adapterOpts: ConstructorParameters<typeof FakeAdapter>[0] = {},
+  dispatcherOpts: { streamProgress?: boolean } = {},
+) {
   const db: Db = memoryDb();
   const channel = new FakeChannel();
   const adapter = new FakeAdapter(adapterOpts);
   const driver = new FakeDriver(adapter);
   const queue = new SessionQueue();
-  const dispatcher = new Dispatcher({ db, channel, driver, queue });
+  // 测试默认关流式卡（老断言按 sent 精确匹配）；流式测试显式开
+  const dispatcher = new Dispatcher({ db, channel, driver, queue, streamProgress: dispatcherOpts.streamProgress ?? false });
   return { db, channel, adapter, driver, queue, dispatcher };
 }
 
@@ -369,4 +373,78 @@ test('turn timeout：群里收到恢复指引而不是干巴巴的「处理失�
   assert.match(text, /上下文没有丢/);
   assert.match(text, /后台/);
   assert.doesNotMatch(text, /^处理失败：turn timeout$/, '不再只回干巴巴的原始错误');
+});
+
+/* --------------------- 流式进度卡（决策 29） --------------------- */
+
+test('流式卡：started 建卡 → delta 节流 patch → final 替换成结果', async () => {
+  const { db, channel, dispatcher } = setup({
+    reply: '这是最终结果',
+    deltas: ['第', '一', '段', '过', '程'],
+    deltaMs: 5,
+    delayMs: 30,
+  }, { streamProgress: true });
+  bind(db, 'oc_a');
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '帮我干活' }));
+  await waitFor(() => channel.sent.length > 0);
+  // 等 turn 完全结束（final 之后 channel.patched 最后一条是结果）
+  await waitFor(() => channel.patched.some((p) => p.text === '这是最终结果'));
+
+  const card = channel.sent.find((m) => m.text === '⏳ 正在处理…');
+  assert.ok(card, 'started 时发了一张进度卡');
+  assert.ok(channel.patched.length >= 1, '过程有 patch');
+  // 节流：5 个 delta 间隔 5ms，patch 间隔下限 1000ms —— 过程 patch 不会每个 delta 一发
+  const processPatches = channel.patched.filter((p) => p.text !== '这是最终结果');
+  assert.ok(processPatches.length < 5, `节流生效（过程 patch ${processPatches.length} < 5 条 delta）`);
+  const last = channel.patched.at(-1)!;
+  assert.equal(last.messageId, card && `fake-msg-${channel.sent.indexOf(card) + 1}`, '替换的还是同一张卡');
+  assert.equal(last.text, '这是最终结果', '过程卡被替换成结果');
+  // 结果不再另发一条消息（sent 里除了进度卡没有别的文本消息）
+  assert.equal(channel.sent.filter((m) => m.text === '这是最终结果').length, 0, '结果直接替换在卡里，不再新发');
+});
+
+test('流式卡：结果超长 → 撤掉过程卡，走分片消息', async () => {
+  const long = '长'.repeat(4200);
+  const { db, channel, dispatcher } = setup({ reply: long, deltas: ['过'], delayMs: 20 }, { streamProgress: true });
+  bind(db, 'oc_a');
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '来个长的' }));
+  await waitFor(() => channel.sent.some((m) => m.text.includes('长')));
+  const card = channel.sent.find((m) => m.text === '⏳ 正在处理…');
+  assert.ok(card, '有过程卡');
+  const cardId = `fake-msg-${channel.sent.indexOf(card) + 1}`;
+  assert.ok(channel.deleted.includes(cardId), '超长结果：过程卡被撤掉');
+  assert.ok(channel.sent.some((m) => m.text.startsWith('长长')), '结果走分片消息');
+});
+
+test('流式卡：turn 报错 → 过程卡替换成错误文案', async () => {
+  const { db, channel, dispatcher } = setup({ fail: true, failError: 'boom', deltas: ['过'], delayMs: 20 }, { streamProgress: true });
+  bind(db, 'oc_a');
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '会失败' }));
+  await waitFor(() => channel.patched.some((p) => p.text.includes('处理失败')));
+  assert.equal(channel.sent.filter((m) => m.text.includes('处理失败')).length, 0, '错误在卡里，不再新发');
+});
+
+test('流式卡：渠道不支持 patches → 完全退化，没有进度卡', async () => {
+  const db: Db = memoryDb();
+  const channel = new FakeChannel();
+  channel.patches = false;
+  const adapter = new FakeAdapter({ reply: 'ok', deltas: ['过'] });
+  const driver = new FakeDriver(adapter);
+  const dispatcher = new Dispatcher({ db, channel, driver, queue: new SessionQueue() });
+  insertBinding(db, { chatId: 'oc_a', sessionId: 'sess-1', agent: 'pi', cwd: '/repo', ownerOpenId: 'ou_owner', mirrorMode: 'off', createdAt: 1 });
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: 'hi' }));
+  await waitFor(() => channel.sent.some((m) => m.text === 'ok'));
+  assert.equal(channel.sent.some((m) => m.text === '⏳ 正在处理…'), false, '不支持的渠道不发进度卡');
+  assert.equal(channel.patched.length, 0);
+});
+
+test('流式卡：不传 streamProgress 时默认开启（生产默认）', async () => {
+  const db: Db = memoryDb();
+  const channel = new FakeChannel();
+  const adapter = new FakeAdapter({ reply: 'ok', deltas: ['过'] });
+  const dispatcher = new Dispatcher({ db, channel, driver: new FakeDriver(adapter), queue: new SessionQueue() });
+  insertBinding(db, { chatId: 'oc_a', sessionId: 'sess-1', agent: 'pi', cwd: '/repo', ownerOpenId: 'ou_owner', mirrorMode: 'off', createdAt: 1 });
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: 'hi' }));
+  await waitFor(() => channel.sent.length > 0);
+  assert.ok(channel.sent.some((m) => m.text === '⏳ 正在处理…'), '默认开流式卡');
 });

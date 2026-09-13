@@ -59,6 +59,12 @@ export interface DispatcherOptions {
   /** bootstrapHistory（§6.2）：绑定时回填群历史，默认开、50 条、7 天内 */
   bootstrap?: { enabled?: boolean; maxMessages?: number; maxAgeDays?: number };
   onTurnEvent?: (event: TurnEvent) => void;
+  /**
+   * 流式进度卡（决策 29）：turn 事件流变成一张原地更新的卡片 ——
+   * 群里能看到执行过程，结束后过程卡被替换成结果。默认开；
+   * 只有渠道声明 patches 能力才生效（飞书 = PATCH interactive 卡片）。
+   */
+  streamProgress?: boolean;
 }
 
 /**
@@ -80,6 +86,7 @@ export class Dispatcher {
     { adapter: AgentAdapter; handle: AgentSessionHandle; turn: TurnHandle; chatId: string }
   >();
   private readonly onTurnEvent?: (event: TurnEvent) => void;
+  private readonly streamProgress: boolean;
   /** 串行化 flush：deliver 与 daemon 定时器可能同时触发，不排队就会同一条发两遍 */
   private flushChain: Promise<void> = Promise.resolve();
 
@@ -98,6 +105,7 @@ export class Dispatcher {
       maxAgeDays: opts.bootstrap?.maxAgeDays ?? 7,
     };
     this.onTurnEvent = opts.onTurnEvent;
+    this.streamProgress = opts.streamProgress ?? true;
   }
 
   /** 渠道事件入口。幂等：同一 event_id 重复投递不会重复执行。 */
@@ -229,12 +237,18 @@ export class Dispatcher {
       turnId = turn.turnId;
       const activeKey = ref.sessionId;
       this.activeTurns.set(activeKey, { adapter, handle, turn, chatId: chatIdOf(msg) });
+      // 决策 29：流式进度卡 —— 渠道不支持原地更新时退化为现有行为
+      const card = this.streamProgress && this.channel.patches === true
+        ? new ProgressCard(this.channel, msg, turnId, log)
+        : null;
       const off = turn.onEvent((event) => {
         this.onTurnEvent?.({ ...event, conversationKey: msg.conversationKey });
+        card?.feed(event);
         log.debug('turn event', { turnId: event.turnId, kind: event.type });
       });
       const result = await turn.settled;
       off();
+      card?.dispose();
       if (this.activeTurns.get(activeKey)?.turn === turn) this.activeTurns.delete(activeKey);
       this.driver.touch(ref);
 
@@ -245,17 +259,34 @@ export class Dispatcher {
           ? '处理超时：这轮超过了时限被中断（会话上下文没有丢，直接发条消息就能继续）。' +
             '建议让耗时任务在后台异步跑、进度写文件，这一轮先短汇报。'
           : `处理失败：${result.error.slice(0, 300)}`;
-        await this.reply(msg.conversationKey, replyText).catch(() => undefined);
+        if (card?.hasCard) {
+          await card.replaceWith(replyText);
+        } else {
+          await this.reply(msg.conversationKey, replyText).catch(() => undefined);
+        }
       }
-      if (result.aborted) log.info('turn aborted', { turnId });
+      if (result.aborted) {
+        log.info('turn aborted', { turnId });
+        if (card?.hasCard) await card.replaceWith('⛔ 已取消');
+      }
 
       clearPendingWindow(this.db, chatId);
       const outgoing = await this.collectMedia(result.text ?? '', ref.cwd);
       const replyInThread = Boolean(msg.threadId);
-      if (outgoing.text.trim()) {
+      // 结果能塞进一张卡（≤ 卡上限且没附件）→ 过程卡原地替换成结果（决策 29）
+      if (
+        outgoing.text.trim() &&
+        outgoing.attachments.length === 0 &&
+        outgoing.text.length <= ProgressCard.RESULT_LIMIT &&
+        card?.hasCard
+      ) {
+        await card.replaceWith(outgoing.text);
+      } else if (outgoing.text.trim()) {
+        await card?.remove();
         await this.deliver(msg.conversationKey, turnId, outgoing.text, msg.replyTo, outgoing.attachments, replyInThread);
       } else if (outgoing.attachments.length > 0) {
         // 只发了文件、没有正文：附件自己就是回复
+        await card?.remove();
         await this.deliver(msg.conversationKey, turnId, '', msg.replyTo, outgoing.attachments, replyInThread);
       }
       markInbound(this.db, msg.id, 'done');
@@ -592,6 +623,167 @@ export class Dispatcher {
 }
 
 const formatTime = (ts: number): string => new Date(ts).toISOString().slice(11, 16); // HH:MM
+
+/**
+ * 流式进度卡状态机（决策 29，抄 xbot 的「Feishu 无流式 → patch 同一张卡」方案）。
+ *
+ * 生命周期：started/delta 来了就发一张进度卡 → delta/tool 节流（≥1s）原地更新 →
+ * final/error/aborted 一次性替换成最终态。结果超长或带附件时 `remove()` 撤掉过程卡，
+ * 走原有的分片消息通道（post + 4000 分片）。
+ *
+ * 进度卡不走 outbound 幂等表：它是过程副产品，daemon 崩了留一张残卡（xbot 同样
+ * 只记内存表），24h 后自然过期；最终结果仍走幂等表。
+ */
+class ProgressCard {
+  /** 结果塞得进一张卡的文本上限（飞书卡片 markdown 元素容量保守值） */
+  static readonly RESULT_LIMIT = 3800;
+  /** patch 内容的展示上限：过程只显示最近这么多字，头部注明折叠 */
+  private static readonly VIEW_LIMIT = 3000;
+  private static readonly PATCH_INTERVAL_MS = 1000;
+
+  private messageId: string | undefined;
+  private acc = '';
+  private timer: NodeJS.Timeout | undefined;
+  private dirty = false;
+  private lastPatched = '';
+
+  private readonly channel: Channel;
+  private readonly msg: InboundMessage;
+  private readonly turnId: string;
+  private readonly log: Logger;
+
+  constructor(channel: Channel, msg: InboundMessage, turnId: string, log: Logger) {
+    this.channel = channel;
+    this.msg = msg;
+    this.turnId = turnId;
+    this.log = log;
+  }
+
+  get hasCard(): boolean {
+    return this.messageId !== undefined;
+  }
+
+  /** turn 事件入口（同步返回，网络操作 fire-and-forget，失败只丢过程不丢结果） */
+  feed(event: TurnEvent): void {
+    if (event.type === 'started') {
+      this.acc = '';
+      void this.ensureCard();
+      return;
+    }
+    if (!this.messageId) {
+      // 没等到 started 直接来 delta/tool 的 adapter：先建卡
+      void this.ensureCard();
+    }
+    if (event.type === 'delta' && event.text) {
+      this.acc += event.text;
+      this.schedulePatch();
+    } else if (event.type === 'tool' && event.text) {
+      this.acc += `\n▸ ${event.text}`;
+      this.schedulePatch();
+    }
+  }
+
+  dispose(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+
+  /** 过程卡 → 最终态（结果/错误/取消）。final 前的待发 patch 一并作废。 */
+  async replaceWith(text: string): Promise<void> {
+    this.dispose();
+    this.dirty = false;
+    const id = await this.patch(text);
+    if (id) this.messageId = id;
+  }
+
+  /** 结果超长/带附件：撤掉过程卡，走原有分片消息 */
+  async remove(): Promise<void> {
+    this.dispose();
+    if (!this.messageId) return;
+    const id = this.messageId;
+    this.messageId = undefined;
+    try {
+      await this.channel.deleteMessage?.(id);
+    } catch (err) {
+      this.log.warn('progress card delete failed', { messageId: id, error: String(err) });
+    }
+  }
+
+  private creating: Promise<void> | undefined;
+
+  private async ensureCard(): Promise<void> {
+    if (this.messageId) return;
+    if (this.creating) return this.creating;
+    this.creating = this.doCreateCard();
+    try {
+      await this.creating;
+    } finally {
+      this.creating = undefined;
+    }
+  }
+
+  private async doCreateCard(): Promise<void> {
+    try {
+      const res = await this.channel.send({
+        conversationKey: this.msg.conversationKey,
+        text: '⏳ 正在处理…',
+        turnId: this.turnId,
+        seq: -1, // 进度卡不占正式分片 seq（文本分片从 0 起，uuid 不撞）
+        ...(this.msg.replyTo ? { replyTo: this.msg.replyTo } : {}),
+        ...(this.msg.threadId ? { replyInThread: true } : {}),
+      });
+      this.messageId = res.messageId || undefined;
+    } catch (err) {
+      this.log.warn('progress card create failed', { error: String(err) });
+    }
+  }
+
+  /** ≥1s 节流：dirty 期间新内容只累积，到点一把 patch（飞书卡片更新有频控） */
+  private schedulePatch(): void {
+    if (this.dirty) return;
+    this.dirty = true;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.patchNow();
+    }, ProgressCard.PATCH_INTERVAL_MS);
+  }
+
+  private async patchNow(): Promise<void> {
+    this.dirty = false;
+    const view = this.view();
+    if (view === this.lastPatched) return;
+    const id = await this.patch(view);
+    if (id) this.messageId = id;
+  }
+
+  /** 过程文本：只展示最近 VIEW_LIMIT 字，头部注明折叠 */
+  private view(): string {
+    const trimmed = this.acc.trim();
+    return trimmed.length <= ProgressCard.VIEW_LIMIT
+      ? trimmed
+      : `…（过程较长已折叠，只显示最近 ${ProgressCard.VIEW_LIMIT} 字）\n${trimmed.slice(-ProgressCard.VIEW_LIMIT)}`;
+  }
+
+  private async patch(text: string): Promise<string | undefined> {
+    const id = this.messageId;
+    try {
+      const res = await this.channel.send({
+        conversationKey: this.msg.conversationKey,
+        text,
+        turnId: this.turnId,
+        seq: -1,
+        ...(id ? { patch: id } : {}),
+      });
+      this.lastPatched = text;
+      return res.messageId || undefined;
+    } catch (err) {
+      // 过程丢了不致命：结果照常走。记 lastPatched 防止下一轮空转重试
+      this.lastPatched = text;
+      this.log.warn('progress card patch failed', { error: String(err) });
+      return undefined;
+    }
+  }
+}
 
 /** 控制命令：/cancel（决策 28）。只认单行（多行消息里夹一行不触发）。 */
 export const isCancelCommand = (text: string): boolean => /^\s*\/cancel\s*$/i.test(text.trim());

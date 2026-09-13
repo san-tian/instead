@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isWithdrawnReplyError, mediaContent, mediaMsgType, textContent } from '../src/channel.ts';
+import { cardContent, isWithdrawnReplyError, mediaContent, mediaMsgType, textContent } from '../src/channel.ts';
 
 /**
  * 出站附件 → 飞书消息形状。上传本身要真调 API（契约测试覆盖），
@@ -34,4 +34,15 @@ test('撤回/找不到的 reply 目标要能认出来（否则这条出站会永
   assert.equal(isWithdrawnReplyError({ code: 99991663 }), false, '别的错误码不能吃掉');
   assert.equal(isWithdrawnReplyError(new Error('boom')), false);
   assert.equal(isWithdrawnReplyError(null), false);
+});
+
+test('cardContent：schema 2.0 单 markdown 元素卡片（决策 29，抄 xbot buildCard）', () => {
+  const card = JSON.parse(cardContent('**粗体** 和 `代码`'));
+  assert.equal(card.schema, '2.0');
+  assert.equal(card.config.wide_screen_mode, true);
+  assert.equal(card.config.update_multi, true, 'update_multi：允许 PATCH 多次更新');
+  const md = card.body.elements[0];
+  assert.equal(md.tag, 'markdown');
+  assert.equal(md.content, '**粗体** 和 `代码`');
+  assert.equal(card.body.elements.length, 1, '单元素：文本本身走 markdown 渲染');
 });
