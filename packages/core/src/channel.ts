@@ -71,6 +71,13 @@ export interface Channel {
     att: InboundAttachment,
   ): Promise<DownloadedAttachment | undefined>;
   doctor(): Promise<DoctorCheck[]>;
+  /**
+   * 支持原地更新消息（飞书卡片 PATCH，决策 29）。
+   * dispatcher 据此决定是否开启流式进度卡。
+   */
+  readonly patches?: boolean;
+  /** 删除自己发过的消息（结果超长时替换进度卡用，xbot 同款 fallback）。失败只记日志 */
+  deleteMessage?(messageId: string): Promise<void>;
 }
 
 export interface ReceiptOptions {

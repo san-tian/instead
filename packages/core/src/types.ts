@@ -69,6 +69,11 @@ export interface OutboundMessage {
   /** 幂等键：同一 turn 的同一 seq 只发一次（缺口 B） */
   turnId: string;
   seq: number;
+  /**
+   * 原地替换该消息而不是新建（决策 29，飞书 = PATCH 卡片）。
+   * 流式进度卡用：过程不断 patch 同一张卡，结束后把过程卡替换成结果。
+   */
+  patch?: string;
 }
 
 export interface SessionRef {

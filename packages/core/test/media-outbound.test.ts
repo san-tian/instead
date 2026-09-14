@@ -22,6 +22,7 @@ function setup(cwd: string, reply: string): { channel: FakeChannel; adapter: Fak
     channel,
     driver: new FakeDriver(adapter),
     queue: new SessionQueue(),
+    streamProgress: false,
   });
   insertBinding(db, {
     chatId: 'oc_a',

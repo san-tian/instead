@@ -64,6 +64,7 @@ export async function runDaemon(): Promise<void> {
   const daemon = new Daemon({
     db,
     channel,
+    streamProgress: process.env.INSTEAD_STREAM_CARDS !== '0',
     adapters: {
       pi: new PiAdapter({ logger, appendSystemPrompt: turnGuidance }),
       claude: new ClaudeAdapter({ logger, appendSystemPrompt: turnGuidance }),

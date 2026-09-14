@@ -30,7 +30,13 @@ export interface FakeChannelState {
 export class FakeChannel implements Channel {
   readonly id = 'feishu' as const;
   readonly sent: OutboundMessage[] = [];
+  /** 决策 29：patch 语义的调用记录（原地更新，不进 sent） */
+  readonly patched: { messageId: string; text: string }[] = [];
+  /** 决策 29：deleteMessage 调用记录 */
+  readonly deleted: string[] = [];
   readonly receipts: { conversationKey: ConversationKey; kind: ReceiptKind; opts?: ReceiptOptions }[] = [];
+  /** 渠道能力：支持原地更新（决策 29），测试可关掉验证退化路径 */
+  patches = true;
   chats: ChatInfo[] = [];
   /** bootstrapHistory 用：预置的历史消息 */
   history: HistoryMessage[] = [];
@@ -59,8 +65,15 @@ export class FakeChannel implements Channel {
     if (this.sendDelayMs > 0) {
       await new Promise((r) => setTimeout(r, this.sendDelayMs));
     }
+    if (msg.patch) {
+      this.patched.push({ messageId: msg.patch, text: msg.text });
+      return { messageId: msg.patch };
+    }
     this.sent.push(msg);
     return { messageId: `fake-msg-${this.sent.length}` };
+  }
+  async deleteMessage(messageId: string): Promise<void> {
+    this.deleted.push(messageId);
   }
   async receipt(
     key: ConversationKey,
@@ -98,6 +111,9 @@ export interface FakeAdapterOptions {
   reply?: string | ((msg: UserMessage) => string);
   /** 每个 turn 的耗时，用来制造排队场景 */
   delayMs?: number;
+  /** 决策 29 测试用：turn 里逐个 emit 的 delta（间隔 deltaMs），最后接 final */
+  deltas?: string[];
+  deltaMs?: number;
   fail?: boolean;
   /** 失败时结算的错误文本（默认 'fake failure'）—— 超时路径测试用 */
   failError?: string;
@@ -130,6 +146,8 @@ export class FakeAdapter implements AgentAdapter {
   private readonly turns = new Map<string, ActiveTurn>();
   private readonly reply: string | ((msg: UserMessage) => string);
   private readonly delayMs: number;
+  private readonly deltas?: string[];
+  private readonly deltaMs: number;
   private readonly fail: boolean;
   private readonly failError?: string;
   private readonly sessionId: string;
@@ -140,6 +158,8 @@ export class FakeAdapter implements AgentAdapter {
   constructor(opts: FakeAdapterOptions = {}) {
     this.reply = opts.reply ?? 'fake reply';
     this.delayMs = opts.delayMs ?? 0;
+    this.deltas = opts.deltas;
+    this.deltaMs = opts.deltaMs ?? 10;
     this.fail = opts.fail ?? false;
     this.failError = opts.failError;
     this.sessionId = opts.sessionId ?? 'fake-session';
@@ -185,6 +205,30 @@ export class FakeAdapter implements AgentAdapter {
       if (active.done) return;
       const key = msg.conversationKey ?? ('feishu:chat:unknown' as ConversationKey);
       emit({ turnId, conversationKey: key, type: 'started' });
+      if (this.deltas && this.deltas.length > 0) {
+        let i = 0;
+        const t = setInterval(() => {
+          if (active.done) {
+            clearInterval(t);
+            return;
+          }
+          if (i < this.deltas!.length) {
+            emit({ turnId, conversationKey: key, type: 'delta', text: this.deltas![i++] });
+          } else {
+            clearInterval(t);
+            if (this.fail) {
+              const err = this.failError ?? 'fake failure';
+              emit({ turnId, conversationKey: key, type: 'error', text: err });
+              finish({ text: '', aborted: false, error: err });
+            } else {
+              const text = typeof this.reply === 'function' ? this.reply(msg) : this.reply;
+              emit({ turnId, conversationKey: key, type: 'final', text });
+              finish({ text, aborted: false });
+            }
+          }
+        }, this.deltaMs ?? 10);
+        return;
+      }
       if (this.fail) {
         const err = this.failError ?? 'fake failure';
         emit({ turnId, conversationKey: key, type: 'error', text: err });

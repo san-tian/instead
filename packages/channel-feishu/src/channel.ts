@@ -147,6 +147,26 @@ export class FeishuChannel implements Channel {
     const chatId = msg.conversationKey.replace(/^feishu:chat:/, '');
     // 飞书幂等键：同一 turn 的同一 seq 重发时，飞书 24h 内去重（配 flush 串行化双保险）
     const uuid = `${msg.turnId}:${msg.seq}`;
+    // 决策 29：patch 语义 = 原地更新那张卡（过程卡 → 结果卡）。patch 失败（跨类型 /
+    // 消息已没了）回退成「新发一张卡 + 删旧卡」，xbot 同款 fallback。
+    if (msg.patch) {
+      const card = cardContent(clipText(msg.text, PATCH_TEXT_LIMIT));
+      try {
+        await this.client.im.message.patch({
+          path: { message_id: msg.patch },
+          data: { content: card },
+        });
+        return { messageId: msg.patch };
+      } catch (err) {
+        this.logger.warn('feishu patch failed, falling back to create+delete', {
+          messageId: msg.patch,
+          error: String(err),
+        });
+        const newId = await this.sendCard(chatId, clipText(msg.text, PATCH_TEXT_LIMIT), msg.replyTo, uuid, msg.replyInThread);
+        await this.deleteMessage(msg.patch).catch(() => undefined);
+        return { messageId: newId };
+      }
+    }
     if (msg.attachments?.length) {
       let lastId = '';
       for (const att of msg.attachments) {
@@ -160,6 +180,48 @@ export class FeishuChannel implements Channel {
       messageId = await this.sendText(chatId, chunk, msg.replyTo, uuid, msg.replyInThread);
     }
     return { messageId };
+  }
+
+  /** 删除自己发过的消息（决策 29：结果超长时撤掉过程卡，xbot 的 deleteMessage 同款） */
+  async deleteMessage(messageId: string): Promise<void> {
+    await this.client.im.message.delete({ path: { message_id: messageId } });
+  }
+
+  /** 发一张 interactive 卡片（msg_type interactive + schema 2.0，copy xbot） */
+  private async sendCard(
+    chatId: string,
+    text: string,
+    replyTo?: string,
+    uuid?: string,
+    replyInThread = false,
+  ): Promise<string> {
+    const content = cardContent(text);
+    if (replyTo) {
+      try {
+        return this.readMessageId(
+          await this.client.im.message.reply({
+            path: { message_id: replyTo },
+            data: {
+              content,
+              msg_type: 'interactive',
+              ...(uuid ? { uuid } : {}),
+              ...(replyInThread ? { reply_in_thread: true } : {}),
+            },
+          }),
+          'feishu card send failed',
+        );
+      } catch (err) {
+        if (!isWithdrawnReplyError(err) || replyInThread) throw err;
+        this.logger.warn('reply target gone, falling back to new card', { replyTo });
+      }
+    }
+    return this.readMessageId(
+      await this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'interactive', content, ...(uuid ? { uuid } : {}) },
+      }),
+      'feishu card send failed',
+    );
   }
 
   /**
@@ -607,6 +669,25 @@ export function isWithdrawnReplyError(err: unknown): boolean {
 /** 文本 → 飞书富文本 post（`md` 元素交给飞书渲染：代码块/表格/加粗都能显示） */
 export const textContent = (chunk: string): string =>
   JSON.stringify({ zh_cn: { content: [[{ tag: 'md', text: chunk }]] } });
+
+/**
+ * 文本 → 飞书 interactive 卡片（schema 2.0，单个 markdown 元素）—— 决策 29。
+ * 抄 xbot 的 `FeishuChannel.buildCard`：飞书没有流式，只有卡片支持 PATCH 原地更新，
+ * 所以过程卡/结果卡都是卡片。`update_multi` 允许多次更新。
+ */
+export const cardContent = (text: string): string =>
+  JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true, update_multi: true },
+    body: { elements: [{ tag: 'markdown', content: text, text_align: 'left', text_size: 'normal' }] },
+  });
+
+/** 卡片 patch 内容的兜底上限：dispatcher 已截断，这里防尾门 */
+export const PATCH_TEXT_LIMIT = 4000;
+
+/** 截尾：卡片 patch 内容超限时只留最后 N 字（折叠头提示） */
+const clipText = (text: string, max: number): string =>
+  text.length <= max ? text : `…（内容较长已折叠）\n${text.slice(-max)}`;
 
 /**
  * 附件 → 飞书 `msg_type` / 消息体。纯函数，便于测试。
