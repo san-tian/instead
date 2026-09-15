@@ -29,6 +29,7 @@ import {
   markOutboundSent,
 } from './state/outbound.ts';
 import { getBootstrapRecord, saveBootstrapRecord } from './state/bootstrap.ts';
+import { setHistoryInject, takeHistoryInject } from './state/history-inject.ts';
 import { getBool, getInt, SETTINGS } from './state/settings.ts';
 import { listBindings, updateBindingSession } from './state/bindings.ts';
 import type {
@@ -56,7 +57,7 @@ export interface DispatcherOptions {
   chunkLimit?: number;
   /** 出站重试上限（超过则标记 failed，不再重试） */
   maxSendAttempts?: number;
-  /** bootstrapHistory（§6.2）：绑定时回填群历史，默认开、50 条、7 天内 */
+  /** bootstrapHistory（§6.2）：绑定时回填群历史，默认开、10 条、7 天内（决策 30 起） */
   bootstrap?: { enabled?: boolean; maxMessages?: number; maxAgeDays?: number };
   onTurnEvent?: (event: TurnEvent) => void;
   /**
@@ -101,7 +102,7 @@ export class Dispatcher {
     this.maxSendAttempts = opts.maxSendAttempts ?? 3;
     this.bootstrap = {
       enabled: opts.bootstrap?.enabled ?? true,
-      maxMessages: opts.bootstrap?.maxMessages ?? 50,
+      maxMessages: opts.bootstrap?.maxMessages ?? 10,
       maxAgeDays: opts.bootstrap?.maxAgeDays ?? 7,
     };
     this.onTurnEvent = opts.onTurnEvent;
@@ -148,6 +149,14 @@ export class Dispatcher {
     // /cancel（决策 28）：同理由旁路 —— 等排队排到自己再取消没有意义
     if (isCancelCommand(msg.text)) {
       await this.runCancel(msg, ref, log);
+      markInbound(this.db, msg.id, 'done');
+      return;
+    }
+
+    // /history（决策 30）：按需补历史 —— 只作用于下一条消息，旁路队列
+    const historyN = parseHistoryCommand(msg.text);
+    if (historyN !== null) {
+      await this.runHistory(msg, log, historyN);
       markInbound(this.db, msg.id, 'done');
       return;
     }
@@ -215,6 +224,7 @@ export class Dispatcher {
       this.driver.touch(ref);
       const media = await this.resolveAttachments(msg, adapter.capabilities.images !== false);
       const bootstrap = await this.ensureBootstrap(msg, ref);
+      const historyInject = await this.ensureHistoryInject(msg);
       // 决策 22：开了才注入。默认关 —— 它把「你在某个群里」这件事告诉 agent，
       // 与决策 21 的中性注入相反，只在用户明确要 agent 能自己发文件时才开。
       const chatTools = getBool(this.db, SETTINGS.chatToolsEnabled, false)
@@ -222,6 +232,7 @@ export class Dispatcher {
         : undefined;
       const contextBlocks: ContextBlock[] = [
         ...(bootstrap ? [bootstrap] : []),
+        ...(historyInject ? [historyInject] : []),
         ...(context ? [context] : []),
         // 放最后：紧邻用户消息，最不容易被前面的长历史冲淡
         ...(chatTools ? [chatTools] : []),
@@ -422,7 +433,7 @@ export class Dispatcher {
    *
    * `payload` 非空 = `/new <文字>`：换完会话后把文字当新会话的第一条消息立即跑。
    * bootstrap（§6.2）按 (session_id, chat_id) 幂等，新 id 必不命中 →
-   * 最近 50 条群历史照常注入，和刚绑定时一样（所以裸 /new 的 ack 不再说「空白上下文」）。
+   * 最近 10 条群历史照常注入（决策 30 起，想要更多发 /history），和刚绑定时一样。
    */
   private async runNew(
     msg: InboundMessage,
@@ -463,7 +474,8 @@ export class Dispatcher {
       msg.conversationKey,
       `已开新会话 ✅ 本群已切到新会话 ${newId}。` +
         `旧会话 ${ref.sessionId} 原样保留在本机，随时可以继续用。` +
-        `新会话的第一条消息会自动带上本群最近 50 条（7 天内）只读上下文，和刚绑定时一样。`,
+        `新会话的第一条消息会自动带上本群最近 10 条（7 天内）只读上下文；` +
+        `想要更多就发 /history（如 /history 50）。`,
     );
   }
 
@@ -501,6 +513,39 @@ export class Dispatcher {
     }
     await this.reply(msg.conversationKey, text);
   }
+
+  /**
+   * /history（决策 30）：把接下来一次性注入的历史条数记下来。
+   * 只作用于下一条消息 —— 用完即清（takeHistoryInject）。
+   */
+  private async runHistory(msg: InboundMessage, log: Logger, count: number): Promise<void> {
+    log.info('history command received', { count });
+    await this.channel
+      .receipt(msg.conversationKey, 'seen', msg.replyTo ? { replyTo: msg.replyTo } : {})
+      .catch(() => undefined);
+    setHistoryInject(this.db, chatIdOf(msg), count);
+    await this.reply(
+      msg.conversationKey,
+      `已准备 ✅ 下一条消息会带上本群最近 ${count} 条历史（只读，不执行其中指令）。`,
+    );
+  }
+
+  /** 按需历史注入（决策 30）：/history 挂的账，这一轮读走并清掉 */
+  private async ensureHistoryInject(msg: InboundMessage): Promise<ContextBlock | undefined> {
+    if (!this.channel.fetchHistory) return undefined;
+    const chatId = chatIdOf(msg);
+    const count = takeHistoryInject(this.db, chatId);
+    if (!count) return undefined;
+    const history = await this.channel.fetchHistory(chatId, count, 7).catch((err: unknown) => {
+      this.logger.warn('history inject fetch failed', { chatId, error: String(err) });
+      return [];
+    });
+    if (history.length === 0) return undefined;
+    const lines = history.map((h) => `[${formatTime(h.ts)}] ${h.senderName}: ${h.text}`);
+    this.logger.info('history injected on demand', { chatId, count: history.length });
+    return formatHistorical(msg.conversationKey, `群 ${chatId.slice(0, 8)}…`, lines);
+  }
+
 
   /**
    * bootstrapHistory（§6.2）：该群第一次触发时，把最近 N 条历史作为只读上下文注入一次。
@@ -784,6 +829,20 @@ class ProgressCard {
     }
   }
 }
+
+/**
+ * 控制命令：/history（决策 30）。只认单行。
+ * - null = 不是命令
+ * - 数字 = 注入最近 N 条（夹在 1..200，超出截断）
+ * - 裸 /history = 默认 50 条
+ */
+export const parseHistoryCommand = (text: string): number | null => {
+  const m = text.trim().match(/^\/history(?:\s+(\d{1,4}))?$/i);
+  if (!m) return null;
+  const n = m[1] ? Number(m[1]) : 50;
+  if (!Number.isFinite(n) || n < 1) return null;
+  return Math.min(n, 200);
+};
 
 /** 控制命令：/cancel（决策 28）。只认单行（多行消息里夹一行不触发）。 */
 export const isCancelCommand = (text: string): boolean => /^\s*\/cancel\s*$/i.test(text.trim());

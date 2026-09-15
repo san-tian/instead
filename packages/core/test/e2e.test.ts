@@ -448,3 +448,63 @@ test('流式卡：不传 streamProgress 时默认开启（生产默认）', asyn
   await waitFor(() => channel.sent.length > 0);
   assert.ok(channel.sent.some((m) => m.text === '⏳ 正在处理…'), '默认开流式卡');
 });
+
+/* --------------------- /history 按需注入（决策 30） --------------------- */
+
+function seedHistory(channel: FakeChannel, n: number): void {
+  channel.history = Array.from({ length: n }, (_, i) => ({
+    id: `h${i}`,
+    senderName: '历史',
+    text: `旧消息${i}`,
+    ts: Date.now() - 60_000 + i,
+  }));
+}
+
+test('bootstrap 默认只带 10 条（决策 30），/history 默认补 50 条', async () => {
+  const { db, channel, adapter, dispatcher } = setup({ reply: 'ok' });
+  bind(db, 'oc_a');
+  seedHistory(channel, 60);
+
+  // 第一轮：bootstrap 注入
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '第一问' }));
+  await waitFor(() => adapter.received.length >= 1);
+  const boot = adapter.received[0]!.context?.find((c) => c.kind === 'historical');
+  assert.ok(boot, '首轮 bootstrap 注入');
+  assert.match(boot!.text, /count="10"/, '默认 10 条，不是 50');
+
+  // 发 /history（默认 50）→ 下一轮注入 50 条
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '/history' }));
+  await waitFor(() => channel.textsFor(keyFor('oc_a')).join('\n').includes('已准备'));
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '第二问' }));
+  await waitFor(() => adapter.received.length >= 2);
+  const inj = adapter.received[1]!.context?.find((c) => c.kind === 'historical');
+  assert.ok(inj, '/history 后注入历史');
+  assert.match(inj!.text, /count="50"/, '默认补 50 条');
+
+  // 再一轮：没有新的历史块（一次性）
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '第三问' }));
+  await waitFor(() => adapter.received.length >= 3);
+  const inj2 = adapter.received[2]!.context?.find((c) => c.kind === 'historical');
+  assert.equal(inj2, undefined, '一次性：用完即清');
+});
+
+test('/history 20：按指定条数注入；/history abc 是普通消息', async () => {
+  const { db, channel, adapter, dispatcher } = setup({ reply: 'ok' });
+  bind(db, 'oc_a');
+  seedHistory(channel, 60);
+  // 先消耗掉 bootstrap
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '第一问' }));
+  await waitFor(() => adapter.received.length >= 1);
+
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '/history 20' }));
+  await waitFor(() => channel.textsFor(keyFor('oc_a')).join('\n').includes('最近 20 条'));
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '第二问' }));
+  await waitFor(() => adapter.received.length >= 2);
+  const inj = adapter.received[1]!.context?.find((c) => c.kind === 'historical');
+  assert.match(inj!.text, /count="20"/, '按指定条数注入');
+
+  // 非法形式 → 不是命令，按普通消息走
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '/history abc' }));
+  await waitFor(() => adapter.received.length >= 3);
+  assert.match(adapter.received[2]!.text, /\/history abc/, '非数字不认，按普通消息走');
+});

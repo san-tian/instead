@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS session_aliases (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS history_injects (
+  chat_id    TEXT PRIMARY KEY,             -- /history 命令（决策 30）：按需补历史，一次性
+  count      INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS bootstrap_records (
   session_id  TEXT NOT NULL,                -- bootstrapHistory（§6.2），每个群只回填一次
   chat_id     TEXT NOT NULL,
