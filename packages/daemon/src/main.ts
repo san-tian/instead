@@ -61,16 +61,20 @@ export async function runDaemon(): Promise<void> {
   });
   // 决策 27：长任务异步化引导（默认文案可用 INSTEAD_AGENT_GUIDANCE 整体替换）
   const turnGuidance = process.env.INSTEAD_AGENT_GUIDANCE ?? DEFAULT_TURN_GUIDANCE;
+  // 单轮时长上限：默认 30 分钟（10 分钟踩过 25+ 工具调用的长轮次），
+  // INSTEAD_TURN_TIMEOUT_MS 可配。超时仍是兜底 —— 真正压时长靠上面的异步化引导。
+  const turnTimeoutMs = Number(process.env.INSTEAD_TURN_TIMEOUT_MS ?? 30 * 60 * 1000);
   const daemon = new Daemon({
     db,
     channel,
     streamProgress: process.env.INSTEAD_STREAM_CARDS !== '0',
     adapters: {
-      pi: new PiAdapter({ logger, appendSystemPrompt: turnGuidance }),
-      claude: new ClaudeAdapter({ logger, appendSystemPrompt: turnGuidance }),
+      pi: new PiAdapter({ logger, appendSystemPrompt: turnGuidance, turnTimeoutMs }),
+      claude: new ClaudeAdapter({ logger, appendSystemPrompt: turnGuidance, turnTimeoutMs }),
       codex: new CodexAdapter({
         logger,
         appendSystemPrompt: turnGuidance,
+        turnTimeoutMs,
         getSandboxMode: () => getSetting(db, 'codex.sandbox_mode') as SandboxMode | undefined,
       }),
     },
