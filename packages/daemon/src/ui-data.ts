@@ -219,7 +219,7 @@ export class UiData {
       },
       settings: {
         bootstrapEnabled: getBool(this.deps.db, SETTINGS.bootstrapEnabled, true),
-        bootstrapMaxMessages: getInt(this.deps.db, SETTINGS.bootstrapMaxMessages, 50),
+        bootstrapMaxMessages: getInt(this.deps.db, SETTINGS.bootstrapMaxMessages, 10),
         bootstrapMaxAgeDays: getInt(this.deps.db, SETTINGS.bootstrapMaxAgeDays, 7),
         pendingWindowMax: getInt(this.deps.db, SETTINGS.pendingWindowMax, 50),
         codexSandboxMode: getSetting(this.deps.db, SETTINGS.codexSandboxMode) ?? '',
