@@ -34,6 +34,19 @@ export class FakeChannel implements Channel {
   readonly patched: { messageId: string; text: string }[] = [];
   /** 决策 29：deleteMessage 调用记录 */
   readonly deleted: string[] = [];
+  /** 决策 32：原生流式卡调用记录 */
+  readonly streamOpens: { cardId: string; messageId: string; initialText: string }[] = [];
+  readonly streamUpdates: { cardId: string; content: string }[] = [];
+  readonly streamFinishes: { cardId: string; summary: string }[] = [];
+  /** 决策 32：false = 模拟不支持 cardkit 的渠道（退回 PATCH 模式） */
+  private _streamCards = true;
+  get streamCards(): boolean {
+    return this._streamCards;
+  }
+  set streamCards(v: boolean) {
+    this._streamCards = v;
+    this.wireStreamCards();
+  }
   readonly receipts: { conversationKey: ConversationKey; kind: ReceiptKind; opts?: ReceiptOptions }[] = [];
   /** 渠道能力：支持原地更新（决策 29），测试可关掉验证退化路径 */
   patches = true;
@@ -50,6 +63,10 @@ export class FakeChannel implements Channel {
   /** 每次 send 挂多久（测试并发 flush 竞态） */
   sendDelayMs = 0;
   private onInbound?: (msg: InboundMessage) => void;
+
+  constructor() {
+    this.wireStreamCards();
+  }
 
   async start(onInbound: (msg: InboundMessage) => void): Promise<void> {
     this.onInbound = onInbound;
@@ -74,6 +91,32 @@ export class FakeChannel implements Channel {
   }
   async deleteMessage(messageId: string): Promise<void> {
     this.deleted.push(messageId);
+  }
+
+  // 决策 32：流式卡三件套（streamCards=false 时置 undefined → 退回 PATCH 模式）
+  openStreamCard?: (target: { conversationKey: ConversationKey; replyTo?: string; replyInThread?: boolean }, initialText: string) => Promise<{ cardId: string; messageId: string }>;
+  updateStreamCard?: (cardId: string, content: string) => Promise<void>;
+  finishStreamCard?: (cardId: string, summary: string) => Promise<void>;
+
+  wireStreamCards(): void {
+    if (!this.streamCards) {
+      this.openStreamCard = undefined;
+      this.updateStreamCard = undefined;
+      this.finishStreamCard = undefined;
+      return;
+    }
+    this.openStreamCard = async (_target, initialText) => {
+      const cardId = `card-${this.streamOpens.length + 1}`;
+      const messageId = `msg-${cardId}`;
+      this.streamOpens.push({ cardId, messageId, initialText });
+      return { cardId, messageId };
+    };
+    this.updateStreamCard = async (cardId, content) => {
+      this.streamUpdates.push({ cardId, content });
+    };
+    this.finishStreamCard = async (cardId, summary) => {
+      this.streamFinishes.push({ cardId, summary });
+    };
   }
   async receipt(
     key: ConversationKey,

@@ -21,7 +21,7 @@ function setup() {
   const channel = new FakeChannel();
   const adapter = new FakeAdapter({ reply: '看到了' });
   const driver = new FakeDriver(adapter);
-  const dispatcher = new Dispatcher({ db, channel, driver, queue: new SessionQueue() });
+  const dispatcher = new Dispatcher({ db, channel, driver, queue: new SessionQueue(), streamProgress: false });
   insertBinding(db, {
     chatId: 'oc_a',
     sessionId: 'sess-1',
@@ -157,7 +157,7 @@ test('不支持图片的 agent（如 claude）：图片落盘给路径，而不�
     const db: Db = memoryDb();
     const channel = new FakeChannel();
     const adapter = new FakeAdapter({ reply: '看到了', images: false });
-    const dispatcher = new Dispatcher({ db, channel, driver: new FakeDriver(adapter), queue: new SessionQueue() });
+    const dispatcher = new Dispatcher({ db, channel, driver: new FakeDriver(adapter), queue: new SessionQueue(), streamProgress: false });
     insertBinding(db, {
       chatId: 'oc_a', sessionId: 'sess-1', agent: 'claude', cwd: '/repo',
       ownerOpenId: 'ou_owner', mirrorMode: 'off', createdAt: 1,

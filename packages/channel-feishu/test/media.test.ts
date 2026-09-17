@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cardContent, isWithdrawnReplyError, mediaContent, mediaMsgType, textContent } from '../src/channel.ts';
+import {
+  cardContent,
+  isWithdrawnReplyError,
+  mediaContent,
+  mediaMsgType,
+  STREAM_ELEMENT_ID,
+  streamCardSpec,
+  streamSummary,
+  textContent,
+} from '../src/channel.ts';
 
 /**
  * 出站附件 → 飞书消息形状。上传本身要真调 API（契约测试覆盖），
@@ -45,4 +54,21 @@ test('cardContent：schema 2.0 单 markdown 元素卡片（决策 29，抄 xbot 
   assert.equal(md.tag, 'markdown');
   assert.equal(md.content, '**粗体** 和 `代码`');
   assert.equal(card.body.elements.length, 1, '单元素：文本本身走 markdown 渲染');
+});
+
+test('streamCardSpec：streaming_mode + element_id + 打字机参数（决策 32，照 dsh-lark）', () => {
+  const card = JSON.parse(streamCardSpec('⏳ 正在处理…'));
+  assert.equal(card.schema, '2.0');
+  assert.equal(card.config.streaming_mode, true, 'streaming_mode 开启原生流式');
+  assert.equal(card.config.streaming_config.print_strategy, 'fast', '显示不落后于 token 速率');
+  assert.equal(card.config.summary.content, '[Generating...]');
+  const md = card.body.elements[0];
+  assert.equal(md.tag, 'markdown');
+  assert.equal(md.element_id, STREAM_ELEMENT_ID, '更新接口按 element_id 定位');
+  assert.equal(md.content, '⏳ 正在处理…');
+});
+
+test('streamSummary：单行 ≤50 字（消息列表预览）', () => {
+  assert.equal(streamSummary('  多行\n 结果  '), '多行 结果');
+  assert.equal(streamSummary('长'.repeat(60)).length, 50, '超长截断到 50 字');
 });
