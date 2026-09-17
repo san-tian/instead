@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PiAdapter } from '../src/adapter.ts';
 import { buildPrompt } from '../src/adapter.ts';
 
 const withSessionDir = () => mkdtempSync(join(tmpdir(), 'instead-pi-'));
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** 契约测试需要真实的 pi CLI；没有就跳过（CI 友好） */
 const hasPi = ((): boolean => {
@@ -88,3 +90,40 @@ test('契约：不带 expectExisting 时依然是新建（群里首次绑定走�
   await adapter.stop(handle);
 });
 
+
+/* ------------ 决策 33：pi 忙时 followUp 排队 + 超时 abort ------------ */
+
+const fakePi = join(__dirname, 'fake-pi.mjs');
+const fakeAdapter = (mode: string, turnTimeoutMs?: number, marker?: string) =>
+  new PiAdapter({
+    command: fakePi, // shebang 直接执行；adapter 的 --mode rpc 等参数它自己忽略
+    sessionDir: withSessionDir(),
+    isolateExtensions: true,
+    env: {
+      FAKE_PI_MODE: mode,
+      ...(marker ? { FAKE_PI_MARKER: marker } : {}),
+    },
+    ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
+  });
+
+test('契约：pi 还在处理旧 turn → 自动用 followUp 排队重发，而不是把会话卡死', async () => {
+  const adapter = fakeAdapter('busy');
+  const handle = await adapter.start({ cwd: process.cwd(), sessionId: 'busy-001' });
+  const turn = await adapter.send(handle, { text: '继续' });
+  const result = await turn.settled;
+  assert.equal(result.error, undefined, '第二次（followUp）应该成功');
+  assert.match(result.text, /OK/);
+  await adapter.stop(handle);
+});
+
+test('契约：turn 超时会向 pi 发 abort（决策 33）', async () => {
+  const marker = join(withSessionDir(), 'abort-marker.txt');
+  const adapter = fakeAdapter('hang', 400, marker);
+  const handle = await adapter.start({ cwd: process.cwd(), sessionId: 'hang-001' });
+  const turn = await adapter.send(handle, { text: '慢慢来' });
+  const result = await turn.settled;
+  assert.equal(result.error, 'turn timeout');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(readFileSync(marker, 'utf8'), '1', '超时应向 pi 发 abort 叫停');
+  await adapter.stop(handle);
+});

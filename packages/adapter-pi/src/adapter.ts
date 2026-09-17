@@ -178,6 +178,9 @@ export class PiAdapter implements AgentAdapter {
       aborted: false,
       timer: setTimeout(() => {
         this.logger.warn('turn timeout', { turnId, sessionId: session.ref.sessionId });
+        // 决策 33：超时也要叫停 pi 侧。不 abort 的话 pi 会继续跑完旧 turn，
+        // 之后的每条消息都被 pi 拒成「Agent is already processing」（线上踩过）。
+        session.client.write({ type: 'abort' });
         void this.finish(session, active, { error: 'turn timeout' });
       }, timeoutMs),
     };
@@ -195,7 +198,19 @@ export class PiAdapter implements AgentAdapter {
     try {
       await session.client.request('prompt', payload);
     } catch (err) {
-      await this.finish(session, active, { error: String(err) });
+      // 决策 33：上一轮超时/被中止后 pi 可能还没停 —— prompt 会被拒
+      // 「Agent is already processing」。按 pi 的提示用 streamingBehavior:
+      // 'followUp' 排队（等 pi 处理完旧 turn 再接我们的消息），而不是把会话卡死。
+      if (/already processing/i.test(String(err)) && !('streamingBehavior' in payload)) {
+        this.logger.warn('pi busy, requeueing with followUp', { turnId, sessionId: session.ref.sessionId });
+        try {
+          await session.client.request('prompt', { ...payload, streamingBehavior: 'followUp' });
+        } catch (err2) {
+          await this.finish(session, active, { error: String(err2) });
+        }
+      } else {
+        await this.finish(session, active, { error: String(err) });
+      }
     }
 
     return {
