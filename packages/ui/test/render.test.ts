@@ -107,7 +107,7 @@ test('客户端只调真实存在的写接口', () => {
   // 改版时我凭记忆写了个 /api/mirror，实际不存在（决策 17 已废弃 mirror）。
   // 这条锁住：脚本里 api('POST', ...) 的路径必须在白名单内。
   const REAL = new Set([
-    '/api/bind', '/api/unbind', '/api/model', '/api/default-model', '/api/settings',
+    '/api/bind', '/api/unbind', '/api/switch-agent', '/api/model', '/api/default-model', '/api/settings',
     '/api/session/release', '/api/doctor/refresh', '/api/chats/refresh',
     '/api/outbound/flush', '/api/outbound/discard', '/api/code', '/api/code/delete',
   ]);

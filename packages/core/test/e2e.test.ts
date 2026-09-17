@@ -508,3 +508,25 @@ test('/history 20：按指定条数注入；/history abc 是普通消息', async
   await waitFor(() => adapter.received.length >= 3);
   assert.match(adapter.received[2]!.text, /\/history abc/, '非数字不认，按普通消息走');
 });
+
+test('/history 0：清除待注入的历史，不丢给 agent（决策 30 补）', async () => {
+  const { db, channel, adapter, dispatcher } = setup({ reply: 'ok' });
+  bind(db, 'oc_a');
+  seedHistory(channel, 30);
+  // 消耗 bootstrap
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '第一问' }));
+  await waitFor(() => adapter.received.length >= 1);
+
+  // 先挂上 20 条，再用 /history 0 清掉
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '/history 20' }));
+  await waitFor(() => channel.textsFor(keyFor('oc_a')).join('\n').includes('已准备'));
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '/history 0' }));
+  await waitFor(() => channel.textsFor(keyFor('oc_a')).join('\n').includes('已清除'));
+  assert.equal(adapter.received.length, 1, '/history 0 是控制命令，不丢给 agent');
+
+  // 下一条消息不带额外历史（也没带 20 条）
+  await dispatcher.handleInbound(inbound({ chatId: 'oc_a', text: '第二问' }));
+  await waitFor(() => adapter.received.length >= 2);
+  const inj = adapter.received[1]!.context?.find((c) => c.kind === 'historical');
+  assert.equal(inj, undefined, '清除后不注入');
+});
