@@ -17,8 +17,10 @@ import {
   newBindCode,
   setSessionAlias,
   setSetting,
+  getBinding,
   setSessionModel,
   SETTINGS,
+  updateBindingAgent,
   type AgentId,
   type Binding,
   type Channel,
@@ -39,6 +41,8 @@ export interface UiDirListing {
   parent?: string;
   dirs: { name: string; path: string }[];
 }
+
+export const AGENTS: readonly AgentId[] = ['pi', 'claude', 'codex'];
 
 /** 目录选择器可浏览的根：默认只有 `$HOME`，需要别的就设 `INSTEAD_FS_ROOTS`（冒号分隔） */
 export function fsRoots(env = process.env): string[] {
@@ -266,6 +270,44 @@ export class UiData {
         }
         log.info('bind created', { chatId: binding.chatId, sessionId: binding.sessionId });
         return { binding };
+      }
+      case '/api/switch-agent': {
+        const agent = String(body.agent ?? '');
+        if (!AGENTS.includes(agent as AgentId)) {
+          throw new UiPathError('unknown_agent', `不认识的 agent：${agent}`);
+        }
+        const chatId = String(body.chatId ?? '');
+        const existing = getBinding(this.deps.db, chatId);
+        if (!existing) {
+          throw new UiPathError('chat_not_bound', '这个群还没绑定，先「连接新的群」');
+        }
+        // 会话不能跨 agent 搬：传了 sessionId = 接管新 agent 的已有会话，
+        // 没传 = 开一条全新会话（is-<ts36>，与 /new、向导新建同构）。
+        const sessionId = String(body.sessionId ?? '') || `is-${Date.now().toString(36)}`;
+        const updated = updateBindingAgent(this.deps.db, chatId, agent as AgentId, sessionId);
+        if (!updated) {
+          throw new UiPathError('chat_not_bound', '这个群还没绑定，先「连接新的群」');
+        }
+        if (body.resumeExisting && sessionId) {
+          upsertResumeAlias(this.deps.db, agent as AgentId, sessionId);
+        }
+        // 旧会话如果没别的群还在用，顺手放掉进程（与 /new 同款）
+        const usedElsewhere = listBindings(this.deps.db).some(
+          (b) => b.sessionId === existing.sessionId && b.chatId !== chatId,
+        );
+        if (!usedElsewhere && existing.sessionId !== sessionId) {
+          void this.deps.pool.release(existing.sessionId).catch((err: unknown) => {
+            log.warn('switch-agent release failed', { sessionId: existing.sessionId, error: String(err) });
+          });
+        }
+        log.info('binding switched agent', {
+          chatId,
+          from: existing.agent,
+          to: agent,
+          sessionId,
+          resumed: Boolean(body.resumeExisting),
+        });
+        return { binding: updated };
       }
       case '/api/unbind': {
         const removed = deleteBinding(this.deps.db, String(body.chatId ?? ''));

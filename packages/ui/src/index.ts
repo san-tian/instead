@@ -264,6 +264,7 @@ function renderConnections() {
         (canModel
           ? '<button class="btn" data-act="model" data-chat="' + esc(b.chatId) + '">换模型</button>'
           : '<span class="dim" style="font-size:12px">模型由 ' + esc(b.agent) + ' 自己管</span>') +
+        '<button class="btn" data-act="agent" data-chat="' + esc(b.chatId) + '">换 agent</button>' +
         (live ? '<button class="btn" data-act="release" data-session="' + esc(b.sessionId) + '">重启会话</button>' : '') +
         '<span class="spacer" style="flex:1"></span>' +
         '<button class="btn danger" data-act="unbind" data-chat="' + esc(b.chatId) + '" ' +
@@ -807,6 +808,7 @@ document.addEventListener('click', function (ev) {
     return;
   }
   if (a === 'model') { openModelDlg(el.dataset.chat); return; }
+  if (a === 'agent') { openAgentDlg(el.dataset.chat); return; }
 
   /* ---- 运维 ---- */
   if (a === 'doctor') { act(function () { return api('POST', '/api/doctor/refresh', {}); }); return; }
@@ -935,6 +937,68 @@ function openChoose(title, hint, options, current, free) {
 
 function bindingOf(chatId) {
   return state.bindings.filter(function (b) { return b.chatId === chatId; })[0];
+}
+
+/** 换 agent（决策 31）：换驱动者 = 新会话起步或接管该 agent 的已有会话；旧会话保留 */
+var AGENT_OPTIONS = [
+  { value: 'pi', label: 'pi', sub: '本机 pi（--mode rpc），运行时换模型、图片输入' },
+  { value: 'claude', label: 'claude', sub: 'Claude Code CLI（一轮一进程，--resume 续跑）' },
+  { value: 'codex', label: 'codex', sub: 'Codex CLI（thread id 学回后 resume）' },
+];
+
+function openAgentDlg(chatId) {
+  var b = bindingOf(chatId);
+  if (!b) return;
+  var label = b.name || shortId(b.chatId);
+  openChoose(
+    '换 agent · ' + label,
+    '换 agent = 本群改由另一个 agent 驱动。会话不能跨 agent 搬：默认开一条新会话（旧会话完整保留），也可以接管新 agent 在 ' + esc(tail(b.cwd)) + ' 下的已有会话。',
+    AGENT_OPTIONS,
+    b.agent,
+    false,
+  ).then(function (agent) {
+    if (agent === null) return;
+    getJSON('/api/sessions?agent=' + agent + '&cwd=' + encodeURIComponent(b.cwd))
+      .then(function (list) {
+        var opts = [{ value: '', label: '+ 新建会话（空白，旧会话保留）' }].concat(
+          (list || []).map(function (s) {
+            return {
+              value: s.sessionId,
+              label: s.sessionId,
+              sub: '最后活动 ' + new Date(s.mtime).toLocaleString(),
+            };
+          }),
+        );
+        openChoose(
+          '接管哪条 ' + agent + ' 会话？',
+          '选「新建」= 从零开始；选已有会话 = 群里接着它继续说（记得之前的上下文）。',
+          opts,
+          '',
+          false,
+        ).then(function (sid) {
+          if (sid === null) return;
+          act(
+            function () {
+              return api('POST', '/api/switch-agent', {
+                chatId: chatId,
+                agent: agent,
+                sessionId: sid || '',
+                resumeExisting: Boolean(sid),
+              });
+            },
+            function (r) {
+              var newSid = r && r.binding ? r.binding.sessionId : sid || '';
+              return sid
+                ? '已切到 ' + agent + ' · 接管会话 ' + newSid
+                : '已切到 ' + agent + ' · 新会话 ' + newSid + '（旧会话原样保留）';
+            },
+          );
+        });
+      })
+      .catch(function (e) {
+        toast(e.message || String(e), 'error');
+      });
+  });
 }
 
 function openModelDlg(chatId) {

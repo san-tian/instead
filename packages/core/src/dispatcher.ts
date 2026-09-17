@@ -523,6 +523,11 @@ export class Dispatcher {
     await this.channel
       .receipt(msg.conversationKey, 'seen', msg.replyTo ? { replyTo: msg.replyTo } : {})
       .catch(() => undefined);
+    if (count === 0) {
+      takeHistoryInject(this.db, chatIdOf(msg));
+      await this.reply(msg.conversationKey, '已清除 ✅ 本群待注入的历史已取消，下一条消息不带额外历史。');
+      return;
+    }
     setHistoryInject(this.db, chatIdOf(msg), count);
     await this.reply(
       msg.conversationKey,
@@ -833,14 +838,15 @@ class ProgressCard {
 /**
  * 控制命令：/history（决策 30）。只认单行。
  * - null = 不是命令
+ * - 0 = 清除待注入（/history 0）
  * - 数字 = 注入最近 N 条（夹在 1..200，超出截断）
  * - 裸 /history = 默认 50 条
  */
 export const parseHistoryCommand = (text: string): number | null => {
   const m = text.trim().match(/^\/history(?:\s+(\d{1,4}))?$/i);
   if (!m) return null;
-  const n = m[1] ? Number(m[1]) : 50;
-  if (!Number.isFinite(n) || n < 1) return null;
+  const n = m[1] !== undefined ? Number(m[1]) : 50;
+  if (!Number.isFinite(n) || n < 0) return null;
   return Math.min(n, 200);
 };
 

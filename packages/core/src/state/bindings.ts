@@ -90,6 +90,24 @@ export function updateBindingSession(
  * 写绑定。`chat_id` 是主键 —— 冲突靠数据库保证，不靠应用层检查（§1.1）。
  * @throws BindError('chat_already_bound')
  */
+/**
+ * 换 agent（决策 31）：只改这条绑定的 agent 与会话 id，其余字段不动。
+ * 会话不能跨 agent 搬 —— 调用方应传新 agent 下的会话 id（空 = 新建由调用方生成）。
+ */
+export function updateBindingAgent(
+  db: Db,
+  chatId: string,
+  agent: AgentId,
+  sessionId: string,
+): Binding | undefined {
+  const existing = getBinding(db, chatId);
+  if (!existing) return undefined;
+  const res = db
+    .prepare('UPDATE bindings SET agent = ?, session_id = ? WHERE chat_id = ?')
+    .run(agent, sessionId, chatId);
+  return res.changes > 0 ? { ...existing, agent, sessionId } : undefined;
+}
+
 export function insertBinding(db: Db, b: Binding): Binding {
   const existing = getBinding(db, b.chatId);
   if (existing) {

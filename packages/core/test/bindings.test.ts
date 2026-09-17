@@ -6,6 +6,7 @@ import {
   consumeBindCode,
   getBindCode,
   getBinding,
+  updateBindingAgent,
   insertBinding,
   issueBindCode,
   listBindingsBySession,
@@ -100,4 +101,20 @@ test('同一 session 重签覆盖旧码', () => {
   issueBindCode(db, { code: '999999', sessionId: 'sess-1', agent: 'pi', cwd: '/repo', now: 2000 });
   assert.equal(getBindCode(db, '111111'), undefined);
   assert.ok(getBindCode(db, '999999'));
+});
+
+test('updateBindingAgent：只改 agent 和会话 id，其余字段不动（决策 31）', () => {
+  const db = memoryDb();
+  insertBinding(db, {
+    chatId: 'oc_a', sessionId: 'sess-old', agent: 'pi', cwd: '/repo',
+    ownerOpenId: 'ou_owner', mirrorMode: 'user', createdAt: 1,
+  });
+  const updated = updateBindingAgent(db, 'oc_a', 'codex', 'is-new1');
+  assert.equal(updated?.agent, 'codex');
+  assert.equal(updated?.sessionId, 'is-new1');
+  assert.equal(updated?.cwd, '/repo', '目录不动');
+  assert.equal(updated?.ownerOpenId, 'ou_owner', 'owner 不动');
+  assert.equal(updated?.mirrorMode, 'user', 'mirror 不动');
+  assert.equal(getBinding(db, 'oc_a')?.agent, 'codex', '落盘');
+  assert.equal(updateBindingAgent(db, 'oc_x', 'pi', 'x'), undefined, '没绑定的群返回 undefined');
 });
