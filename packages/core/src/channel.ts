@@ -78,6 +78,19 @@ export interface Channel {
   readonly patches?: boolean;
   /** 删除自己发过的消息（结果超长时替换进度卡用，xbot 同款 fallback）。失败只记日志 */
   deleteMessage?(messageId: string): Promise<void>;
+  /**
+   * 原生流式卡（决策 32，cardkit）：开一张流式卡片实例并发出消息。
+   * 飞书客户端会按 cardElement.content 的增量做打字机动画（dsh-lark 同款）。
+   * 没实现的渠道 = 不支持原生流式，dispatcher 自动退回 PATCH 整卡模式。
+   */
+  openStreamCard?(
+    target: { conversationKey: ConversationKey; replyTo?: string; replyInThread?: boolean },
+    initialText: string,
+  ): Promise<{ cardId: string; messageId: string }>;
+  /** 流式更新卡内文本（全量内容，sequence/uuid 由渠道内部管理） */
+  updateStreamCard?(cardId: string, content: string): Promise<void>;
+  /** 结束流式（关打字机光标 + 更新消息列表摘要） */
+  finishStreamCard?(cardId: string, summary: string): Promise<void>;
 }
 
 export interface ReceiptOptions {

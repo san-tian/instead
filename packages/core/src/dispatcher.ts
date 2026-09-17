@@ -288,7 +288,7 @@ export class Dispatcher {
       if (
         outgoing.text.trim() &&
         outgoing.attachments.length === 0 &&
-        outgoing.text.length <= ProgressCard.RESULT_LIMIT &&
+        outgoing.text.length <= (card?.resultLimit ?? ProgressCard.RESULT_LIMIT) &&
         card?.hasCard
       ) {
         await card.replaceWith(outgoing.text);
@@ -685,13 +685,16 @@ const formatTime = (ts: number): string => new Date(ts).toISOString().slice(11, 
  * 只记内存表），24h 后自然过期；最终结果仍走幂等表。
  */
 class ProgressCard {
-  /** 结果塞得进一张卡的文本上限（飞书卡片 markdown 元素容量保守值） */
+  /** 结果塞得进一张卡的文本上限：PATCH 模式 3800；cardkit 流式 29_000（元素上限减余量） */
   static readonly RESULT_LIMIT = 3800;
-  /** patch 内容的展示上限：过程只显示最近这么多字，头部注明折叠 */
+  private static readonly STREAM_RESULT_LIMIT = 29_000;
+  /** PATCH 模式的过程展示上限：整卡替换没有动画，太长浪费 payload */
   private static readonly VIEW_LIMIT = 3000;
   private static readonly PATCH_INTERVAL_MS = 1000;
 
-  private messageId: string | undefined;
+  private streamCardId: string | undefined;
+  private streamMessageId: string | undefined;
+  private legacyMessageId: string | undefined;
   private acc = '';
   private timer: NodeJS.Timeout | undefined;
   private dirty = false;
@@ -709,8 +712,18 @@ class ProgressCard {
     this.log = log;
   }
 
+  /** 是否走 cardkit 原生流式（打字机动画，决策 32） */
+  private get streamMode(): boolean {
+    return typeof this.channel.openStreamCard === 'function';
+  }
+
   get hasCard(): boolean {
-    return this.messageId !== undefined;
+    return this.streamCardId !== undefined || this.legacyMessageId !== undefined;
+  }
+
+  /** 结果能直接替换进卡的上限：流式 29_000，PATCH 3800 */
+  get resultLimit(): number {
+    return this.streamMode ? ProgressCard.STREAM_RESULT_LIMIT : ProgressCard.RESULT_LIMIT;
   }
 
   /** turn 事件入口（同步返回，网络操作 fire-and-forget，失败只丢过程不丢结果） */
@@ -720,7 +733,7 @@ class ProgressCard {
       void this.ensureCard();
       return;
     }
-    if (!this.messageId) {
+    if (!this.hasCard) {
       // 没等到 started 直接来 delta/tool 的 adapter：先建卡
       void this.ensureCard();
     }
@@ -738,31 +751,39 @@ class ProgressCard {
     this.timer = undefined;
   }
 
-  /** 过程卡 → 最终态（结果/错误/取消）。final 前的待发 patch 一并作废。 */
+  /**
+   * 过程卡 → 最终态（结果/错误/取消）。
+   * 流式模式：全量替换内容（新旧前缀不同 → 客户端直接上屏）+ finish 关打字机光标；
+   * PATCH 模式：最后一条 patch 就是最终态。
+   */
   async replaceWith(text: string): Promise<void> {
     this.dispose();
     this.dirty = false;
-    const id = await this.patch(text);
-    if (id) this.messageId = id;
+    await this.patch(text);
+    if (this.streamCardId) {
+      await this.finishStream(text);
+    }
   }
 
   /** 结果超长/带附件：撤掉过程卡，走原有分片消息 */
   async remove(): Promise<void> {
     this.dispose();
-    if (!this.messageId) return;
-    const id = this.messageId;
-    this.messageId = undefined;
+    const msgId = this.streamMessageId ?? this.legacyMessageId;
+    this.streamCardId = undefined;
+    this.streamMessageId = undefined;
+    this.legacyMessageId = undefined;
+    if (!msgId) return;
     try {
-      await this.channel.deleteMessage?.(id);
+      await this.channel.deleteMessage?.(msgId);
     } catch (err) {
-      this.log.warn('progress card delete failed', { messageId: id, error: String(err) });
+      this.log.warn('progress card delete failed', { messageId: msgId, error: String(err) });
     }
   }
 
   private creating: Promise<void> | undefined;
 
   private async ensureCard(): Promise<void> {
-    if (this.messageId) return;
+    if (this.hasCard) return;
     if (this.creating) return this.creating;
     this.creating = this.doCreateCard();
     try {
@@ -774,6 +795,20 @@ class ProgressCard {
 
   private async doCreateCard(): Promise<void> {
     try {
+      if (this.streamMode) {
+        // 决策 32：cardkit 流式卡（客户端打字机动画）
+        const r = await this.channel.openStreamCard!(
+          {
+            conversationKey: this.msg.conversationKey,
+            ...(this.msg.replyTo ? { replyTo: this.msg.replyTo } : {}),
+            ...(this.msg.threadId ? { replyInThread: true } : {}),
+          },
+          '⏳ 正在处理…',
+        );
+        this.streamCardId = r.cardId;
+        this.streamMessageId = r.messageId;
+        return;
+      }
       const res = await this.channel.send({
         conversationKey: this.msg.conversationKey,
         text: '⏳ 正在处理…',
@@ -782,13 +817,13 @@ class ProgressCard {
         ...(this.msg.replyTo ? { replyTo: this.msg.replyTo } : {}),
         ...(this.msg.threadId ? { replyInThread: true } : {}),
       });
-      this.messageId = res.messageId || undefined;
+      this.legacyMessageId = res.messageId || undefined;
     } catch (err) {
       this.log.warn('progress card create failed', { error: String(err) });
     }
   }
 
-  /** ≥1s 节流：dirty 期间新内容只累积，到点一把 patch（飞书卡片更新有频控） */
+  /** ≥1s 节流：dirty 期间新内容只累积，到点一把 patch */
   private schedulePatch(): void {
     if (this.dirty) return;
     this.dirty = true;
@@ -802,21 +837,24 @@ class ProgressCard {
     this.dirty = false;
     const view = this.view();
     if (view === this.lastPatched) return;
-    const id = await this.patch(view);
-    if (id) this.messageId = id;
+    await this.patch(view);
   }
 
-  /** 过程文本：只展示最近 VIEW_LIMIT 字，头部注明折叠 */
+  /** 过程文本：流式模式不折叠（打字机靠前缀关系），PATCH 模式只展示最近 3000 字 */
   private view(): string {
     const trimmed = this.acc.trim();
-    return trimmed.length <= ProgressCard.VIEW_LIMIT
-      ? trimmed
-      : `…（过程较长已折叠，只显示最近 ${ProgressCard.VIEW_LIMIT} 字）\n${trimmed.slice(-ProgressCard.VIEW_LIMIT)}`;
+    if (this.streamMode || trimmed.length <= ProgressCard.VIEW_LIMIT) return trimmed;
+    return `…（过程较长已折叠，只显示最近 ${ProgressCard.VIEW_LIMIT} 字）\n${trimmed.slice(-ProgressCard.VIEW_LIMIT)}`;
   }
 
-  private async patch(text: string): Promise<string | undefined> {
-    const id = this.messageId;
+  private async patch(text: string): Promise<void> {
     try {
+      if (this.streamCardId) {
+        await this.channel.updateStreamCard!(this.streamCardId, text);
+        this.lastPatched = text;
+        return;
+      }
+      const id = this.legacyMessageId;
       const res = await this.channel.send({
         conversationKey: this.msg.conversationKey,
         text,
@@ -825,13 +863,30 @@ class ProgressCard {
         ...(id ? { patch: id } : {}),
       });
       this.lastPatched = text;
-      return res.messageId || undefined;
+      if (res.messageId) this.legacyMessageId = res.messageId;
     } catch (err) {
-      // 过程丢了不致命：结果照常走。记 lastPatched 防止下一轮空转重试
+      // 过程丢了不致命：结果照常走
       this.lastPatched = text;
       this.log.warn('progress card patch failed', { error: String(err) });
-      return undefined;
     }
+  }
+
+  private async finishStream(text: string): Promise<void> {
+    const cardId = this.streamCardId;
+    if (!cardId) return;
+    this.streamCardId = undefined;
+    this.streamMessageId = undefined;
+    try {
+      await this.channel.finishStreamCard!(cardId, this.summaryOf(text));
+    } catch (err) {
+      this.log.warn('progress card finish failed', { cardId, error: String(err) });
+    }
+  }
+
+  /** 消息列表摘要：单行、≤50 字（与 channel 的 streamSummary 同口径） */
+  private summaryOf(text: string): string {
+    const cleaned = text.replace(/\s+/g, ' ').trim();
+    return cleaned.length <= 50 ? cleaned : `${cleaned.slice(0, 49)}…`;
   }
 }
 

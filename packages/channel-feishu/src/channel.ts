@@ -187,6 +187,108 @@ export class FeishuChannel implements Channel {
     await this.client.im.message.delete({ path: { message_id: messageId } });
   }
 
+  /* ────── 原生流式卡（决策 32，cardkit，照 dsh-lark） ────── */
+
+  /** 每张流式卡的内部状态：sequence 单调递增，更新串行化（cardkit 拒绝乱序） */
+  private readonly streamState = new Map<
+    string,
+    { sequence: number; queue: Promise<unknown>; }
+  >();
+
+  /** 开一张流式卡：先建卡片实体，再发引用它的消息 */
+  async openStreamCard(
+    target: { conversationKey: string; replyTo?: string; replyInThread?: boolean },
+    initialText: string,
+  ): Promise<{ cardId: string; messageId: string }> {
+    const chatId = target.conversationKey.replace(/^feishu:chat:/, '');
+    const spec = streamCardSpec(initialText);
+    const created = await this.client.cardkit.v1.card.create({
+      data: { type: 'card_json', data: spec },
+    });
+    const err = created as { code?: number; msg?: string };
+    if (err.code !== undefined && err.code !== 0) {
+      throw new Error(`cardkit card.create failed: code=${err.code} msg=${err.msg ?? ''}`);
+    }
+    const cardId = (created as { data?: { card_id?: string } }).data?.card_id;
+    if (!cardId) throw new Error('cardkit card.create returned no card_id');
+
+    // 引用卡片实体发消息（msg_type interactive + content {type:'card', data:{card_id}}）
+    const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+    let messageId = '';
+    if (target.replyTo) {
+      try {
+        messageId = this.readMessageId(
+          await this.client.im.message.reply({
+            path: { message_id: target.replyTo },
+            data: {
+              content,
+              msg_type: 'interactive',
+              ...(target.replyInThread ? { reply_in_thread: true } : {}),
+            },
+          }),
+          'feishu stream card reply failed',
+        );
+      } catch (err) {
+        if (!isWithdrawnReplyError(err) || target.replyInThread) throw err;
+        this.logger.warn('reply target gone, falling back to new stream card', {
+          replyTo: target.replyTo,
+        });
+      }
+    }
+    if (!messageId) {
+      messageId = this.readMessageId(
+        await this.client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: { receive_id: chatId, msg_type: 'interactive', content },
+        }),
+        'feishu stream card send failed',
+      );
+    }
+    this.streamState.set(cardId, { sequence: 0, queue: Promise.resolve() });
+    return { cardId, messageId };
+  }
+
+  /** 流式更新卡内文本：全量内容 + 单调 sequence（客户端按前缀差做打字机动画） */
+  async updateStreamCard(cardId: string, content: string): Promise<void> {
+    const state = this.streamState.get(cardId);
+    if (!state) throw new Error('unknown stream card');
+    const seq = ++state.sequence;
+    // 串行化：同一张卡的更新必须按序到达
+    state.queue = state.queue.then(() =>
+      this.client.cardkit.v1.cardElement.content({
+        path: { card_id: cardId, element_id: STREAM_ELEMENT_ID },
+        data: {
+          content: content.length > STREAM_CONTENT_LIMIT ? content.slice(-STREAM_CONTENT_LIMIT) : content,
+          sequence: seq,
+          uuid: `c_${cardId}_${seq}`,
+        },
+      }),
+    );
+    await state.queue;
+  }
+
+  /** 结束流式：关打字机光标 + 更新列表摘要（不更新摘要会永远显示 [Generating...]） */
+  async finishStreamCard(cardId: string, summary: string): Promise<void> {
+    const state = this.streamState.get(cardId);
+    if (!state) return;
+    const seq = ++state.sequence;
+    state.queue = state.queue.then(() =>
+      this.client.cardkit.v1.card.settings({
+        path: { card_id: cardId },
+        data: {
+          settings: JSON.stringify({ config: { streaming_mode: false, summary: { content: summary } } }),
+          sequence: seq,
+          uuid: `s_${cardId}_${seq}`,
+        },
+      }),
+    );
+    try {
+      await state.queue;
+    } finally {
+      this.streamState.delete(cardId);
+    }
+  }
+
   /** 发一张 interactive 卡片（msg_type interactive + schema 2.0，copy xbot） */
   private async sendCard(
     chatId: string,
@@ -684,6 +786,41 @@ export const cardContent = (text: string): string =>
 
 /** 卡片 patch 内容的兜底上限：dispatcher 已截断，这里防尾门 */
 export const PATCH_TEXT_LIMIT = 4000;
+
+/** 流式卡 markdown 元素的 element_id：更新接口按它定位（决策 32） */
+export const STREAM_ELEMENT_ID = 'stream_md';
+
+/** cardkit 流式元素内容上限（飞书超了回 230099），留点余量 */
+export const STREAM_CONTENT_LIMIT = 29_000;
+
+/**
+ * 流式卡初始 JSON（决策 32，照 dsh-lark 的 buildStreamingCard）：
+ * `streaming_mode: true` 让客户端把 cardElement.content 的增量按打字机渲染；
+ * `print_strategy: fast` 避免显示落后于上游 token 速率；
+ * `summary` 是消息列表里的预览（不设的话收尾后列表里永远显示 [Generating...]）。
+ */
+export const streamCardSpec = (initialText: string): string =>
+  JSON.stringify({
+    schema: '2.0',
+    config: {
+      streaming_mode: true,
+      summary: { content: '[Generating...]' },
+      streaming_config: {
+        print_frequency_ms: { default: 70 },
+        print_step: { default: 1 },
+        print_strategy: 'fast',
+      },
+    },
+    body: {
+      elements: [{ tag: 'markdown', element_id: STREAM_ELEMENT_ID, content: initialText }],
+    },
+  });
+
+/** 消息列表摘要：单行、≤50 字（dsh-lark 的 truncateSummary） */
+export const streamSummary = (text: string): string => {
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  return cleaned.length <= 50 ? cleaned : `${cleaned.slice(0, 49)}…`;
+};
 
 /** 截尾：卡片 patch 内容超限时只留最后 N 字（折叠头提示） */
 const clipText = (text: string, max: number): string =>
